@@ -1,0 +1,9 @@
+# First run: scaffolds Modelfile, builds agent, pings, opens REPL
+ollama-fs.py -m gemma4 -a openclaw ./my_project
+
+# Edit ~/.config/ollama-fs/agents/openclaw/Modelfile
+# Second run: detects Modelfile changed, rebuilds, pings, opens REPL
+ollama-fs.py -m gemma4 -a openclaw ./my_project
+
+# No changes: skips build entirely, just pings and opens REPL
+ollama-fs.py -m gemma4 -a openclaw ./my_project

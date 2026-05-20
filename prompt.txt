@@ -1,0 +1,64 @@
+I am pasting a custom Python utility script below that I use locally.
+
+Please analyze this code and understand its architecture. Your goal is to act
+as an expert developer who can maintain, troubleshoot, or extend it for me in
+the future.
+
+### What This Script Does:
+1. It is a terminal-native CLI utility (`ollama-fs`) designed to run locally.
+2. It wraps around a local Ollama instance to give the LLM interactive,
+   sandboxed file-system capabilities.
+3. It maps native Python file-handling functions (Read, Write, and Shallow
+   Directory Scanning) into Ollama's structured "Tools/Function Calling" API.
+4. It manages a secure sandbox environment — allowing the model to read and
+   write files while inheriting the exact system permissions of the user, and
+   preventing directory traversal attacks via os.path.abspath + os.sep prefix
+   checking.
+5. It features a responsive UI with a background loading spinner (used both
+   during inference and during the startup ping) and real-time streaming output
+   directly to sys.stdout.
+
+### CLI Flags (argparse — not positional sys.argv):
+- `-m / --model MODEL`   Base Ollama model to run (e.g. gemma4, llama3)
+- `-a / --agent AGENT`   Named agent to launch (e.g. openclaw, hermes)
+- `workspace`            Positional: path to the sandboxed workspace folder
+- `--safe`               Require y/n confirmation before every file write,
+                         showing a unified diff for existing files
+- `--debug`              Append structured JSONL session logs to
+                         .ollama-fs-debug.jsonl inside the workspace
+
+### Agent System:
+- When -m and -a are both supplied, the script scaffolds a Modelfile at
+  ~/.config/ollama-fs/agents/<agent_name>/Modelfile (if absent), then runs
+  `ollama create` to register it with Ollama.
+- The Modelfile template includes FROM (injected from -m at scaffold time),
+  SYSTEM prompt, and PARAMETER blocks (temperature, num_ctx, repeat_penalty,
+  top_p, top_k).
+- A .built sentinel file prevents unnecessary rebuilds — the agent is only
+  re-created when the Modelfile has been modified since the last build.
+- If -a is supplied without -m, the script assumes the agent is already
+  registered in Ollama and skips scaffolding.
+
+### Startup Sequence:
+- Agent scaffolding and `ollama create` run before the REPL opens.
+- A startup ping fires a non-streaming probe to verify the chat target responds
+  before entering the interactive loop. A spinner runs during the ping with the
+  message "may take a minute". On failure, a diagnostic checklist is printed
+  and the process exits cleanly.
+
+### Manifest / File Visibility:
+- The top-level workspace snapshot shown to the model at session start hides
+  internal files: .ollama-fs-debug.jsonl and .git are excluded from the
+  listing so they don't pollute the model's context.
+
+### Please respond with a brief confirmation acknowledging:
+1. The logic flow of the interactive tool-calling loop (how it handles
+   sequential tool requests).
+2. The security sandbox mechanism used to protect the local system.
+3. The agent scaffolding lifecycle (scaffold → build → sentinel → ping).
+4. Two or three smart recommendations for future features or performance
+   optimizations we could add later.
+
+Here is the script:
+
+[PASTE YOUR SCRIPT HERE]

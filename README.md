@@ -15,17 +15,38 @@ A terminal CLI utility that gives a local [Ollama](https://ollama.com) model san
 
 ## Installation
 
-No installation required. Just make the script executable:
+No installation required beyond the dependency above.
+
+### macOS / Linux
+
+Make the script executable and optionally symlink it onto your PATH so you can call it from anywhere without the `.py` extension:
 
 ```bash
 chmod +x ollama-fs.py
-```
-
-Optionally symlink it onto your PATH:
-
-```bash
 ln -s /path/to/ollama-fs.py /usr/local/bin/ollama-fs
 ```
+
+Then call it as `ollama-fs` from any directory.
+
+> **macOS note:** If you installed Ollama via the `.dmg` app, it runs as a menu bar process rather than a background service. Just make sure the Ollama app is open — the startup ping will tell you immediately if it isn't.
+
+### Windows
+
+Use the Windows-specific script `ollama-fs-windows.py` instead, which replaces the ANSI spinner with a Windows-compatible alternative using the `colorama` package:
+
+```powershell
+pip install -r requirements-windows.txt
+python ollama-fs-windows.py -m gemma4 .\my_project
+```
+
+To call it without the `.py` extension from anywhere, add its folder to your `PATH` via System Properties → Environment Variables, or create a `.bat` wrapper:
+
+```bat
+@echo off
+python C:\path\to\ollama-fs-windows.py %*
+```
+
+Save that as `ollama-fs.bat` somewhere already on your PATH (e.g. `C:\Windows\System32`) and call it as `ollama-fs` from any terminal.
 
 ---
 

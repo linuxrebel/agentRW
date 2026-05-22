@@ -216,6 +216,53 @@ tools = [
             },
         },
     },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'move_local_file',
+            'description': (
+                'Move or rename a file or directory within the workspace. '
+                'Behaves like the Linux mv command: supplying a new filename in the '
+                'same directory renames it; supplying a different directory path moves it. '
+                'Parent directories of the destination are created automatically.'
+            ),
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'source_path': {
+                        'type': 'string',
+                        'description': 'Current path of the file or directory relative to the workspace root'
+                    },
+                    'destination_path': {
+                        'type': 'string',
+                        'description': 'Target path relative to the workspace root (new name and/or new location)'
+                    },
+                },
+                'required': ['source_path', 'destination_path'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'delete_local_file',
+            'description': (
+                'Permanently delete a file from the workspace. '
+                'Only deletes individual files, not directories. '
+                'This operation is irreversible.'
+            ),
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'relative_path': {
+                        'type': 'string',
+                        'description': 'Path of the file to delete, relative to the workspace root'
+                    },
+                },
+                'required': ['relative_path'],
+            },
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -316,6 +363,86 @@ def write_local_file(relative_path: str, content: str) -> str:
         return f"Success: Written to {relative_path}"
     except Exception as e:
         return f"Error writing file: {str(e)}"
+
+def move_local_file(source_path: str, destination_path: str) -> str:
+    """
+    Move or rename a file or directory inside the sandbox.
+    Mirrors Linux mv behaviour:
+      - Same directory + new name  ->  rename
+      - Different directory        ->  move (destination dirs created automatically)
+    Always confirms with the user before acting; Enter alone defaults to No.
+    """
+    safe_src  = _safe_resolve(source_path)
+    safe_dest = _safe_resolve(destination_path)
+
+    if safe_src is None:
+        debug_log('sandbox_violation', {'op': 'move_src', 'path': source_path})
+        return "Error: Access denied. Source path is outside the designated workspace."
+    if safe_dest is None:
+        debug_log('sandbox_violation', {'op': 'move_dest', 'path': destination_path})
+        return "Error: Access denied. Destination path is outside the designated workspace."
+    if not os.path.exists(safe_src):
+        return f"Error: Source '{source_path}' does not exist."
+    if os.path.exists(safe_dest):
+        return f"Error: Destination '{destination_path}' already exists. Remove it first or choose a different name."
+
+    action = "Rename" if os.path.dirname(safe_src) == os.path.dirname(safe_dest) else "Move"
+    print(f"\n[{action}] I'm about to {action.lower()} '{source_path}'  ->  '{destination_path}'")
+    print( "  Is this what you want?")
+    while True:
+        answer = input(f"  {action}? [N/y] > ").strip().lower()
+        if answer in ('y', 'yes'):
+            break
+        elif answer in ('n', 'no', ''):   # bare Enter defaults to No
+            debug_log('move_denied', {'src': source_path, 'dest': destination_path})
+            return f"{action} cancelled."
+        else:
+            print("  Please enter y or n (Enter = No).")
+
+    try:
+        os.makedirs(os.path.dirname(safe_dest), exist_ok=True)
+        os.rename(safe_src, safe_dest)
+        debug_log('tool_call', {'op': 'move', 'src': source_path, 'dest': destination_path})
+        return f"Success: Moved '{source_path}' -> '{destination_path}'"
+    except Exception as e:
+        return f"Error moving file: {str(e)}"
+
+
+def delete_local_file(relative_path: str) -> str:
+    """
+    Permanently delete a single file inside the sandbox.
+    Refuses to delete directories (use explicit file paths only).
+    Always confirms with the user before acting; Enter alone defaults to No.
+    """
+    safe_path = _safe_resolve(relative_path)
+
+    if safe_path is None:
+        debug_log('sandbox_violation', {'op': 'delete', 'path': relative_path})
+        return "Error: Access denied. Cannot delete files outside the designated workspace."
+    if not os.path.exists(safe_path):
+        return f"Error: '{relative_path}' does not exist."
+    if os.path.isdir(safe_path):
+        return f"Error: '{relative_path}' is a directory. Only individual files can be deleted."
+
+    print(f"\n[Delete] I'm about to permanently delete '{relative_path}'.")
+    print( "  This operation cannot be undone. Is this what you want?")
+    while True:
+        answer = input("  Delete? [N/y] > ").strip().lower()
+        if answer in ('y', 'yes'):
+            break
+        elif answer in ('n', 'no', ''):   # bare Enter defaults to No
+            debug_log('delete_denied', {'path': relative_path})
+            return f"Delete cancelled for '{relative_path}'."
+        else:
+            print("  Please enter y or n (Enter = No).")
+
+    try:
+        os.remove(safe_path)
+        debug_log('tool_call', {'op': 'delete', 'path': relative_path})
+        return f"Success: Deleted '{relative_path}'"
+    except Exception as e:
+        return f"Error deleting file: {str(e)}"
+
 
 # ---------------------------------------------------------------------------
 # Agent scaffolding
@@ -532,7 +659,12 @@ while True:
                     args_     = tool['function']['arguments']
                     rel_path  = args_.get('relative_path')
 
-                    print(f"\n[System: {func_name} on '{rel_path}']")
+                    # move_local_file has source + destination rather than a single path
+                    if func_name == 'move_local_file':
+                        log_label = f"'{args_.get('source_path')}' -> '{args_.get('destination_path')}'"
+                    else:
+                        log_label = f"'{rel_path}'"
+                    print(f"\n[System: {func_name} on {log_label}]")
 
                     if func_name == 'list_directory_contents':
                         result = list_directory_contents(rel_path)
@@ -540,6 +672,10 @@ while True:
                         result = read_local_file(rel_path)
                     elif func_name == 'write_local_file':
                         result = write_local_file(rel_path, args_['content'])
+                    elif func_name == 'move_local_file':
+                        result = move_local_file(args_['source_path'], args_['destination_path'])
+                    elif func_name == 'delete_local_file':
+                        result = delete_local_file(rel_path)
                     else:
                         result = "Unknown tool"
 

@@ -1,0 +1,10 @@
+# Python bytecode caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Local backup files (e.g. ollama-fs.py.bak)
+*.bak
+
+# Runtime debug logs (created in the agent's starting directory)
+.ollama-fs-debug.jsonl

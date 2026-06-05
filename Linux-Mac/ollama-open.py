@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
-# ollama-fs-windows.py - Windows-compatible version of ollama-fs (agentRW variant)
-#
-# Differences from ollama-fs.py (Linux/Mac):
-#   1. Uses colorama to enable ANSI escape codes in Windows terminals.
-#   2. Agent Modelfiles are stored in %APPDATA%\ollama-fs\agents\.
-#   3. Uses subprocess.run() instead of os.system() for `ollama create`.
-#   4. Persistent shell is PowerShell (not bash); supports cd, ls, cat, git, etc.
-#   5. Non-blocking shell read uses a thread + queue.Queue (Windows has no
-#      select() on pipes - only sockets).
-#
-# Same agentRW semantics as the Linux/Mac version: no sandbox, full user-level
-# filesystem access, shell-exec via run_shell_command, persistent cwd / env
-# vars / PowerShell session state across calls.
+"""
+ollama-open (unsandboxed variant of ollama-fs)
+
+Gives a local Ollama model full read/write access to the file system at the
+same privilege level as the invoking user, plus the ability to execute shell
+commands as that user. Paths supplied by the model may be absolute, relative
+to the starting directory, or use ~ for the user's home.
+
+Sibling: ollama-fsb.py (sandboxed: confines the agent to a single directory).
+"""
 
 import os
 import sys
@@ -22,26 +19,15 @@ import argparse
 import subprocess
 import threading
 import itertools
-import queue
+import select
 import uuid
 import ollama
-
-# ---------------------------------------------------------------------------
-# Windows ANSI support via colorama
-# ---------------------------------------------------------------------------
-try:
-    import colorama
-    colorama.init()
-except ImportError:
-    print("ERROR: 'colorama' is not installed.")
-    print("Run:  pip install -r requirements-windows.txt")
-    sys.exit(1)
 
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(
-    prog='ollama-fs (agentRW, Windows)',
+    prog='ollama-open',
     description=(
         'Terminal CLI agent that gives a local Ollama model full read/write '
         'and shell-exec access at the privilege of the invoking user. '
@@ -50,11 +36,11 @@ parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     epilog=(
         'Examples:\n'
-        '  ollama-fs-windows.py -m gemma4 C:\\Users\\me\\projects\\foo\n'
-        '  ollama-fs-windows.py -m gemma4 -a openclaw C:\\\n'
-        '  ollama-fs-windows.py -m gemma4 . --safe\n'
-        '  ollama-fs-windows.py -m gemma4 . --safe --debug\n'
-        '  ollama-fs-windows.py -a openclaw ~\n'
+        '  ollama-open.py -m gemma4 ~/projects/foo\n'
+        '  ollama-open.py -m gemma4 -a openclaw /\n'
+        '  ollama-open.py -m gemma4 /home/james --safe\n'
+        '  ollama-open.py -m gemma4 . --safe --debug\n'
+        '  ollama-open.py -a openclaw ~                # agent only\n'
     )
 )
 
@@ -72,7 +58,9 @@ parser.add_argument('--debug', action='store_true',
 args = parser.parse_args()
 
 if args.agent and args.model:
-    AGENT_NAME, MODEL_NAME, CHAT_TARGET = args.agent, args.model, args.agent
+    AGENT_NAME = args.agent
+    MODEL_NAME = args.model
+    CHAT_TARGET = args.agent
 elif args.agent:
     AGENT_NAME, MODEL_NAME, CHAT_TARGET = args.agent, None, args.agent
 elif args.model:
@@ -87,6 +75,7 @@ CWD = os.path.abspath(os.path.expanduser(args.start_dir))
 if not os.path.isdir(CWD):
     parser.error(f"Starting directory does not exist or is not a directory: {CWD}")
 
+# Make relative paths from the model resolve naturally
 os.chdir(CWD)
 
 # Session cwd - mutable; tracks where the persistent shell currently is.
@@ -94,12 +83,9 @@ os.chdir(CWD)
 SESSION_CWD = CWD
 
 DEBUG_LOG_PATH = os.path.join(CWD, '.ollama-fs-debug.jsonl')
+AGENTS_DIR = os.path.expanduser('~/.config/ollama-fs/agents')
 
-# %APPDATA%\ollama-fs\agents\ (falls back to home if APPDATA unset)
-_appdata = os.environ.get('APPDATA') or os.path.expanduser('~')
-AGENTS_DIR = os.path.join(_appdata, 'ollama-fs', 'agents')
-
-# Shell defaults
+# Shell command defaults
 SHELL_TIMEOUT_DEFAULT = 120
 SHELL_OUTPUT_CAP = 8000
 
@@ -117,7 +103,7 @@ def debug_log(event, payload):
         sys.stderr.write(f'[debug_log error] {exc}\n')
 
 # ---------------------------------------------------------------------------
-# Spinner (colorama makes \r and \033[K work on Windows)
+# Spinner
 # ---------------------------------------------------------------------------
 class LoadingSpinner:
     def __init__(self, message="Thinking..."):
@@ -157,7 +143,7 @@ def get_top_level_manifest():
         for item in sorted(items):
             path = os.path.join(CWD, item)
             if os.path.isdir(path):
-                lines.append(f"  [Directory] {item}\\")
+                lines.append(f"  [Directory] {item}/")
             else:
                 lines.append(f"  [File]      {item}")
         return "\n".join(lines)
@@ -168,9 +154,8 @@ def get_top_level_manifest():
 # Tool definitions - paths may be absolute, relative to start_dir, or ~-expanded
 # ---------------------------------------------------------------------------
 _PATH_DOC = (
-    "Path to operate on. May be absolute (e.g. C:\\Windows\\System32\\drivers\\etc\\hosts), "
-    "relative to the starting directory, or use ~ for the user's home (e.g. ~/Documents/foo.txt). "
-    "Forward slashes also work."
+    "Path to operate on. May be absolute (e.g. /etc/hostname), relative to the "
+    "starting directory, or use ~ for the user's home (e.g. ~/Documents/foo.txt)."
 )
 
 tools = [
@@ -181,7 +166,9 @@ tools = [
             'description': 'List the files and subdirectories of any directory the invoking user can read.',
             'parameters': {
                 'type': 'object',
-                'properties': {'path': {'type': 'string', 'description': _PATH_DOC}},
+                'properties': {
+                    'path': {'type': 'string', 'description': _PATH_DOC},
+                },
                 'required': ['path'],
             },
         },
@@ -193,7 +180,9 @@ tools = [
             'description': 'Read the complete text content of any file the invoking user can read.',
             'parameters': {
                 'type': 'object',
-                'properties': {'path': {'type': 'string', 'description': _PATH_DOC}},
+                'properties': {
+                    'path': {'type': 'string', 'description': _PATH_DOC},
+                },
                 'required': ['path'],
             },
         },
@@ -249,7 +238,9 @@ tools = [
             'description': 'Permanently delete a single file (not a directory). Irreversible.',
             'parameters': {
                 'type': 'object',
-                'properties': {'path': {'type': 'string', 'description': _PATH_DOC}},
+                'properties': {
+                    'path': {'type': 'string', 'description': _PATH_DOC},
+                },
                 'required': ['path'],
             },
         },
@@ -259,17 +250,17 @@ tools = [
         'function': {
             'name': 'run_shell_command',
             'description': (
-                'Execute a PowerShell command with the same privileges as the invoking user. '
-                'The PowerShell session is persistent: cd, $env: variables, defined functions, '
-                'and sourced scripts carry across calls. Use this for git, ls/dir, cat/Get-Content, '
-                'package managers, network tools - anything available in PowerShell.'
+                'Execute a shell command with the same privileges as the invoking user. '
+                'Runs in the starting directory unless the command itself changes directory. '
+                'Returns combined stdout/stderr and the exit code. Use this for git, ls, grep, '
+                'find, package managers, network tools, anything available in the user\'s shell.'
             ),
             'parameters': {
                 'type': 'object',
                 'properties': {
                     'command': {
                         'type': 'string',
-                        'description': 'The PowerShell command line to execute (e.g. "ls C:\\Windows", "git status", "python script.py").',
+                        'description': 'The shell command line to execute (e.g. "ls -la /etc", "git status", "python3 script.py").',
                     },
                     'timeout_seconds': {
                         'type': 'integer',
@@ -292,7 +283,7 @@ def _resolve(path: str) -> str:
     return os.path.abspath(os.path.join(SESSION_CWD, expanded))
 
 # ---------------------------------------------------------------------------
-# File tool implementations
+# Tool implementations
 # ---------------------------------------------------------------------------
 def list_directory_contents(path: str) -> str:
     abs_path = _resolve(path)
@@ -306,7 +297,7 @@ def list_directory_contents(path: str) -> str:
         for item in sorted(items):
             item_path = os.path.join(abs_path, item)
             kind = 'Directory' if os.path.isdir(item_path) else 'File'
-            suffix = '\\' if os.path.isdir(item_path) else ''
+            suffix = '/' if os.path.isdir(item_path) else ''
             lines.append(f"  [{kind:9}] {item}{suffix}")
         result = "\n".join(lines)
         debug_log('tool_call', {'op': 'list', 'path': abs_path, 'result_lines': len(lines)})
@@ -336,6 +327,7 @@ def read_local_file(path: str) -> str:
 
 def write_local_file(path: str, content: str, mode: str = 'overwrite') -> str:
     abs_path = _resolve(path)
+    # Normalize mode: anything other than explicit 'append' becomes overwrite.
     append_mode = (mode == 'append')
 
     if SAFE_MODE:
@@ -441,7 +433,7 @@ def delete_local_file(path: str) -> str:
     if not os.path.exists(abs_path):
         return f"Error: '{abs_path}' does not exist."
     if os.path.isdir(abs_path):
-        return f"Error: '{abs_path}' is a directory. Only individual files can be deleted via this tool. Use run_shell_command + Remove-Item -Recurse if you really mean it."
+        return f"Error: '{abs_path}' is a directory. Only individual files can be deleted via this tool. Use run_shell_command + rm -rf if you really mean it."
 
     if SAFE_MODE:
         print(f"\n[Delete] About to permanently delete '{abs_path}'.")
@@ -467,74 +459,39 @@ def delete_local_file(path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Persistent PowerShell session
-# ---------------------------------------------------------------------------
-# Windows has no select() on pipes, so a background daemon thread drains
-# stdout into a Queue. The run_shell_command read loop pulls from the queue
-# with a timeout instead of blocking on select.
-#
-# PowerShell is launched with -Command - which makes it read script from
-# stdin and execute as commands. After each user command we emit a sentinel
-# line carrying exit code and $PWD.Path so we can detect completion and
-# track the shell's current directory.
+# Persistent bash session - lets `cd`, `export`, sourced scripts, etc. persist
+# across run_shell_command calls (matches how a human terminal works).
 # ---------------------------------------------------------------------------
 _SHELL = None
-_SHELL_QUEUE = None
-_SHELL_READER = None
-
-def _shell_reader_loop(proc, q):
-    """Daemon thread: pumps stdout lines from PowerShell into a Queue."""
-    try:
-        for line in iter(proc.stdout.readline, ''):
-            if not line:
-                break
-            q.put(line)
-    except Exception:
-        pass
-    finally:
-        q.put(None)  # EOF sentinel
 
 def _ensure_shell():
-    global _SHELL, _SHELL_QUEUE, _SHELL_READER
+    global _SHELL
     if _SHELL is None or _SHELL.poll() is not None:
-        # CREATE_NEW_PROCESS_GROUP lets us signal the shell with CTRL_BREAK
-        # without affecting our own process.
-        creationflags = 0
-        if hasattr(subprocess, 'CREATE_NEW_PROCESS_GROUP'):
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
         _SHELL = subprocess.Popen(
-            ['powershell.exe', '-NoLogo', '-NoProfile', '-Command', '-'],
+            ['/bin/bash', '--norc', '--noprofile'],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             cwd=SESSION_CWD,
             text=True,
             bufsize=1,
-            creationflags=creationflags,
         )
-        _SHELL_QUEUE = queue.Queue()
-        _SHELL_READER = threading.Thread(
-            target=_shell_reader_loop, args=(_SHELL, _SHELL_QUEUE), daemon=True
-        )
-        _SHELL_READER.start()
-        # Quiet the shell.
+        # Quiet shell, no prompt noise; errors do not kill the shell.
         try:
-            _SHELL.stdin.write('$ErrorActionPreference = "Continue"\n')
+            _SHELL.stdin.write('set +e\nexport PS1=""\nexport PS2=""\n')
             _SHELL.stdin.flush()
         except Exception:
             pass
     return _SHELL
 
 def _restart_shell():
-    global _SHELL, _SHELL_QUEUE, _SHELL_READER
+    global _SHELL
     if _SHELL is not None:
         try:
             _SHELL.kill()
         except Exception:
             pass
     _SHELL = None
-    _SHELL_QUEUE = None
-    _SHELL_READER = None
 
 
 def run_shell_command(command: str, timeout_seconds=None) -> str:
@@ -544,7 +501,7 @@ def run_shell_command(command: str, timeout_seconds=None) -> str:
 
     if SAFE_MODE:
         print(f"\n[Shell] About to execute in {SESSION_CWD}:")
-        print(f"  PS> {command}")
+        print(f"  $ {command}")
         while True:
             answer = input("  Execute? [N/y] > ").strip().lower()
             if answer in ('y', 'yes'):
@@ -558,20 +515,10 @@ def run_shell_command(command: str, timeout_seconds=None) -> str:
     proc = _ensure_shell()
     marker = f"__OLLAMA_FS_DONE_{uuid.uuid4().hex}__"
 
-    # Sentinel logic for PowerShell:
-    #   $__success = $?              # last command success bool
-    #   $__lec = $LASTEXITCODE       # native-command exit code (or stale)
-    #   $__rc = if ($__lec) { $__lec } elseif ($__success) { 0 } else { 1 }
-    sentinel_emit = (
-        f'$__success = $?; '
-        f'$__lec = $LASTEXITCODE; '
-        f'$__rc = if ($__lec) {{ $__lec }} elseif ($__success) {{ 0 }} else {{ 1 }}; '
-        f'Write-Output "{marker} $__rc $($PWD.Path)"'
-    )
-
     try:
-        proc.stdin.write(command + '\n')
-        proc.stdin.write(sentinel_emit + '\n')
+        # Run user command, then emit a sentinel line carrying exit code and PWD.
+        proc.stdin.write(f"{command}\n")
+        proc.stdin.write(f"__rc=$?; printf '%s %d %s\\n' '{marker}' \"$__rc\" \"$PWD\"\n")
         proc.stdin.flush()
     except (BrokenPipeError, OSError) as e:
         _restart_shell()
@@ -589,21 +536,21 @@ def run_shell_command(command: str, timeout_seconds=None) -> str:
             timed_out = True
             break
         try:
-            line = _SHELL_QUEUE.get(timeout=min(remaining, 0.5))
-        except queue.Empty:
-            continue
-        if line is None:
-            # shell died (EOF from reader thread)
+            ready, _, _ = select.select([proc.stdout], [], [], min(remaining, 0.5))
+        except Exception:
             break
-        if marker in line:
-            # parse "MARKER <rc> <pwd>"
-            idx = line.find(marker)
-            tail = line[idx + len(marker):].strip()
-            parts = tail.split(None, 1)
+        if not ready:
+            continue
+        line = proc.stdout.readline()
+        if not line:
+            # shell died
+            break
+        if line.startswith(marker):
+            parts = line.strip().split(None, 2)
             try:
-                exit_code = int(parts[0])
-                if len(parts) >= 2:
-                    new_pwd = parts[1].strip()
+                exit_code = int(parts[1])
+                if len(parts) >= 3:
+                    new_pwd = parts[2]
             except (ValueError, IndexError):
                 pass
             break
@@ -631,7 +578,7 @@ def run_shell_command(command: str, timeout_seconds=None) -> str:
         'cwd': SESSION_CWD, 'bytes': len(output), 'truncated': truncated,
     })
 
-    header = f"PS> {command}    (cwd: {SESSION_CWD})"
+    header = f"$ {command}    (cwd: {SESSION_CWD})"
     parts_out = [header, f"[exit code: {exit_code}]"]
     if output:
         parts_out.append(output.rstrip())
@@ -641,17 +588,20 @@ def run_shell_command(command: str, timeout_seconds=None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Agent scaffolding
+# Agent scaffolding (unchanged interface; updated SYSTEM prompt for agentRW)
 # ---------------------------------------------------------------------------
 _MODELFILE_TEMPLATE = """\
 FROM {base_model}
 
+# ---------------------------------------------------------------------------
+# SYSTEM PROMPT
+# ---------------------------------------------------------------------------
 SYSTEM \"\"\"
 You are {agent_name}, a CLI assistant with the same filesystem and shell
 privileges as the invoking user. You can read, write, move, and delete files
-anywhere that user has permission, and you can execute PowerShell commands
-the same way they would in their terminal. Use absolute paths when possible.
-Be precise, explain your actions, and confirm intent before destructive ops.
+anywhere that user has permission, and you can execute shell commands the
+same way they would in their terminal. Use absolute paths when possible. Be
+precise, explain your actions, and confirm intent before destructive ops.
 \"\"\"
 
 PARAMETER temperature 0.7
@@ -686,12 +636,9 @@ def ensure_agent_built(agent_name: str, modelfile_path: str):
             needs_build = False
     if needs_build:
         print(f"[Agent] Building '{agent_name}' from Modelfile...")
-        result = subprocess.run(
-            ['ollama', 'create', agent_name, '-f', modelfile_path],
-            capture_output=False,
-        )
-        if result.returncode != 0:
-            print(f"[Agent] ERROR: 'ollama create' failed (exit code {result.returncode}).")
+        ret = os.system(f'ollama create {agent_name} -f "{modelfile_path}"')
+        if ret != 0:
+            print(f"[Agent] ERROR: 'ollama create' failed (exit {ret}).")
             sys.exit(1)
         with open(sentinel_path, 'w') as fh:
             fh.write(time.strftime('%Y-%m-%dT%H:%M:%S'))
@@ -713,15 +660,15 @@ def startup_ping(chat_target: str):
         )
         spinner.stop()
         reply = probe.get('message', {}).get('content', '').strip()
-        print(f"OK '{chat_target}' is ready  (replied: \"{reply}\")")
+        print(f"\u2713 '{chat_target}' is ready  (replied: \"{reply}\")")
         debug_log('startup_ping', {'target': chat_target, 'reply': reply, 'status': 'ok'})
     except Exception as exc:
         spinner.stop()
-        print(f"FAILED '{chat_target}' did not respond.\n")
+        print(f"\u2717 '{chat_target}' did not respond.\n")
         print(f"[Startup Error] {exc}")
-        print("  * Is the Ollama app running?     -> Open Ollama from the Start menu")
-        print(f"  * Is the model pulled?           -> ollama pull {chat_target}")
-        print(f"  * Is the agent registered?       -> ollama list")
+        print("  - Is the Ollama server running?  ->  ollama serve")
+        print(f"  - Is the model pulled?           ->  ollama pull {chat_target}")
+        print(f"  - Is the agent registered?       ->  ollama list | grep {chat_target}")
         debug_log('startup_ping', {'target': chat_target, 'error': str(exc), 'status': 'failed'})
         sys.exit(1)
 
@@ -739,28 +686,26 @@ startup_ping(CHAT_TARGET)
 # Session bootstrap
 # ---------------------------------------------------------------------------
 manifest = get_top_level_manifest()
-USER = os.environ.get('USERNAME') or os.environ.get('USER') or 'the invoking user'
+USER = os.environ.get('USER') or os.environ.get('USERNAME') or 'the invoking user'
 
 messages = [{
     'role': 'system',
     'content': (
         f"You are a CLI agent with the same filesystem and shell privileges as the "
         f"invoking user ({USER}). You can read, write, move, and delete files "
-        f"anywhere that user can, including absolute paths like C:\\Windows, "
-        f"C:\\Users\\{USER}, etc. You can also execute PowerShell commands as that "
-        f"user via run_shell_command - the PowerShell session is persistent, so cd, "
-        f"$env: vars, and defined functions carry across calls. Paths may be "
-        f"absolute, relative to the starting directory ({CWD}), or use ~ for the "
-        f"user's home. Prefer absolute paths when the user names a specific "
-        f"location. Explain destructive actions before performing them.\n\n"
+        f"anywhere that user can, including absolute paths like /etc, /var, "
+        f"/home/{USER}, etc. You can also execute shell commands as that user via "
+        f"run_shell_command. Paths may be absolute, relative to the starting "
+        f"directory ({CWD}), or use ~ for the user's home. Prefer absolute paths "
+        f"when the user names a specific location. Explain destructive actions "
+        f"before performing them.\n\n"
         f"IMPORTANT - REPORTING TOOL RESULTS:\n"
         f"When a tool returns data, report it accurately. Do NOT summarize, "
-        f"paraphrase, or invent tool output. If the user asks you to ls, dir, "
-        f"cat, Get-Content, list, show, or display something, reproduce the "
-        f"actual tool output - never make up filenames or content based on what "
-        f"you 'expect' a typical Windows system to contain. The tool already "
-        f"truncates long output if needed, so if you got data back, that is the "
-        f"real data.\n\n"
+        f"paraphrase, or invent tool output. If the user asks you to `ls`, "
+        f"`cat`, list, show, or display something, reproduce the actual tool "
+        f"output - never make up filenames or content based on what you 'expect' "
+        f"a typical Linux system to contain. The tool already truncates long "
+        f"output if needed, so if you got data back, that is the real data.\n\n"
         f"Starting directory snapshot:\n{manifest}"
     )
 }]
@@ -774,7 +719,6 @@ debug_log('session_start', {
     'user':        USER,
 })
 
-
 # ---------------------------------------------------------------------------
 # Banner
 # ---------------------------------------------------------------------------
@@ -784,7 +728,6 @@ if AGENT_NAME:
 print(f"Target:   {CHAT_TARGET}")
 print(f"User:     {USER}  (no sandbox - full user-level access)")
 print(f"Start:    {CWD}")
-print(f"Shell:    powershell.exe (persistent session)")
 if SAFE_MODE:
     print("Mode:     [SAFE] - writes / moves / deletes / shell exec require confirmation")
 if DEBUG_MODE:
@@ -859,7 +802,7 @@ while True:
                     if func_name == 'move_local_file':
                         log_label = f"'{args_.get('source_path')}' -> '{args_.get('destination_path')}'"
                     elif func_name == 'run_shell_command':
-                        log_label = f"PS> {str(args_.get('command', ''))[:80]}"
+                        log_label = f"$ {str(args_.get('command', ''))[:80]}"
                     else:
                         log_label = f"'{args_.get('path', '')}'"
                     print(f"\n[System: {func_name} on {log_label}]")
@@ -899,9 +842,12 @@ while True:
 
     except KeyboardInterrupt:
         spinner.stop()
+        # Kill any in-flight shell command; shell will be respawned at SESSION_CWD on next use.
         _restart_shell()
         print("\n[Cancelled by Ctrl-C. Returning to prompt.]")
         debug_log('user_cancel', {})
+        # Rewind conversation to before the user message that triggered this turn,
+        # so the cancelled turn does not pollute future context.
         while messages and messages[-1].get('role') != 'system':
             popped = messages.pop()
             if popped.get('role') == 'user':

@@ -202,12 +202,23 @@ tools = [
         'type': 'function',
         'function': {
             'name': 'write_local_file',
-            'description': 'Write or overwrite text content to any file path the invoking user can write. Parent directories are created automatically.',
+            'description': (
+                'Write text content to a file. Use mode="overwrite" (default) to replace '
+                'the file contents, or mode="append" to add to the end of an existing file '
+                '(creates it if absent). Parent directories are created automatically. '
+                'Use append mode when accumulating output across multiple calls, such as '
+                'building up a report or log file incrementally.'
+            ),
             'parameters': {
                 'type': 'object',
                 'properties': {
                     'path':    {'type': 'string', 'description': _PATH_DOC},
-                    'content': {'type': 'string', 'description': 'Exact text content to write.'},
+                    'content': {'type': 'string', 'description': 'Exact text content to write or append.'},
+                    'mode':    {
+                        'type': 'string',
+                        'enum': ['overwrite', 'append'],
+                        'description': 'overwrite (default) replaces file contents; append adds to the end.',
+                    },
                 },
                 'required': ['path', 'content'],
             },
@@ -323,11 +334,20 @@ def read_local_file(path: str) -> str:
         return f"Error reading file: {e}"
 
 
-def write_local_file(path: str, content: str) -> str:
+def write_local_file(path: str, content: str, mode: str = 'overwrite') -> str:
     abs_path = _resolve(path)
+    append_mode = (mode == 'append')
 
     if SAFE_MODE:
-        if os.path.exists(abs_path):
+        if append_mode:
+            existing_size = os.path.getsize(abs_path) if os.path.exists(abs_path) else 0
+            print(f"\n[Safe Mode] Append to '{abs_path}'  (existing size: {existing_size} bytes)")
+            preview_lines = content.splitlines()[:20]
+            print('--- content to append ---')
+            print('\n'.join(preview_lines))
+            if len(content.splitlines()) > 20:
+                print(f"  ... ({len(content.splitlines()) - 20} more lines)")
+        elif os.path.exists(abs_path):
             try:
                 with open(abs_path, 'r', encoding='utf-8') as f:
                     existing_lines = f.readlines()
@@ -352,13 +372,14 @@ def write_local_file(path: str, content: str) -> str:
             if len(content.splitlines()) > 20:
                 print(f"  ... ({len(content.splitlines()) - 20} more lines)")
 
+        action_word = 'append' if append_mode else 'write'
         while True:
-            answer = input("\n  Confirm write? [y/n] > ").strip().lower()
+            answer = input(f"\n  Confirm {action_word}? [y/n] > ").strip().lower()
             if answer in ('y', 'yes'):
                 break
             elif answer in ('n', 'no'):
-                debug_log('write_denied', {'path': abs_path})
-                return f"Write cancelled by user for '{abs_path}'."
+                debug_log('write_denied', {'path': abs_path, 'mode': mode})
+                return f"{action_word.capitalize()} cancelled by user for '{abs_path}'."
             else:
                 print("  Please enter y or n.")
 
@@ -366,9 +387,12 @@ def write_local_file(path: str, content: str) -> str:
         parent = os.path.dirname(abs_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        with open(abs_path, 'w', encoding='utf-8') as f:
+        open_mode = 'a' if append_mode else 'w'
+        with open(abs_path, open_mode, encoding='utf-8') as f:
             f.write(content)
-        debug_log('tool_call', {'op': 'write', 'path': abs_path, 'bytes': len(content)})
+        debug_log('tool_call', {'op': 'write', 'path': abs_path, 'mode': mode, 'bytes': len(content)})
+        if append_mode:
+            return f"Success: Appended {len(content)} bytes to {abs_path}"
         return f"Success: Written to {abs_path}"
     except PermissionError:
         return f"Error: Permission denied writing '{abs_path}'."
@@ -845,7 +869,11 @@ while True:
                     elif func_name == 'read_local_file':
                         result = read_local_file(args_.get('path', ''))
                     elif func_name == 'write_local_file':
-                        result = write_local_file(args_.get('path', ''), args_.get('content', ''))
+                        result = write_local_file(
+                            args_.get('path', ''),
+                            args_.get('content', ''),
+                            args_.get('mode', 'overwrite'),
+                        )
                     elif func_name == 'move_local_file':
                         result = move_local_file(args_.get('source_path', ''), args_.get('destination_path', ''))
                     elif func_name == 'delete_local_file':

@@ -126,12 +126,16 @@ When a command times out (default 120 seconds, configurable per-call), the shell
 
 When you supply both `-m` and `-a`, both variants manage the full agent lifecycle:
 
-1. **Scaffold** — Creates `~/.config/ollama-fs/agents/<agent_name>/Modelfile` (Linux/macOS) or `%APPDATA%\ollama-fs\agents\<agent_name>\Modelfile` (Windows) if it doesn't exist, pre-filled with your base model, an appropriate system prompt for the chosen variant, and tunable parameters.
+1. **Scaffold** — Creates a per-variant agent directory:
+   - `ollama-fsb`:  `~/.config/ollama-fsb/agents/<agent_name>/Modelfile`  (Linux/macOS) or `%APPDATA%\ollama-fsb\agents\<agent_name>\Modelfile`  (Windows)
+   - `ollama-open`: `~/.config/ollama-open/agents/<agent_name>/Modelfile` (Linux/macOS) or `%APPDATA%\ollama-open\agents\<agent_name>\Modelfile` (Windows)
+
+   Pre-filled with your base model, an appropriate system prompt for the chosen variant, and tunable parameters.
 2. **Build** — Runs `ollama create <agent_name>` to register the agent with Ollama.
 3. **Sentinel** — Writes a `.built` timestamp next to the Modelfile. On subsequent launches, the agent is only rebuilt if the Modelfile has been edited.
 4. **Ping** — Sends a probe to confirm the agent is responsive before opening the REPL.
 
-> Agents are launched by name, not by variant. If you build an agent via `ollama-fsb` and then run it via `ollama-open`, the agent's Modelfile-baked SYSTEM prompt may still mention sandbox semantics. Re-scaffold (delete `~/.config/ollama-fs/agents/<name>/`) when switching variants for the same agent name, or use different agent names per variant.
+> The two variants keep their agent Modelfiles in separate directories, so you can have the same agent name (e.g. `openclaw`) scaffolded differently for each — `ollama-fsb` gets a sandbox-oriented SYSTEM prompt, `ollama-open` gets a full-access one. They still share the single Ollama model registry, so if you build `openclaw` under both, the second `ollama create` overwrites the first. Either use different names (`openclaw-fsb` / `openclaw-open`) or accept that whichever variant you used most recently wins.
 
 ### Modelfile parameters
 

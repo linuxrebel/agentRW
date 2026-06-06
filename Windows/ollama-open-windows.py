@@ -97,9 +97,9 @@ SESSION_CWD = CWD
 
 DEBUG_LOG_PATH = os.path.join(CWD, '.ollama-fs-debug.jsonl')
 
-# %APPDATA%\ollama-fs\agents\ (falls back to home if APPDATA unset)
+# %APPDATA%\ollama-open\agents\ (falls back to home if APPDATA unset)
 _appdata = os.environ.get('APPDATA') or os.path.expanduser('~')
-AGENTS_DIR = os.path.join(_appdata, 'ollama-fs', 'agents')
+AGENTS_DIR = os.path.join(_appdata, 'ollama-open', 'agents')
 
 # Shell defaults
 SHELL_TIMEOUT_DEFAULT = 120

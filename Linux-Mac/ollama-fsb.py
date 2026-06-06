@@ -81,7 +81,7 @@ if not os.path.exists(TARGET_DIR):
 DEBUG_LOG_PATH = os.path.join(TARGET_DIR, '.ollama-fs-debug.jsonl')
 
 # Fixed config dir for agent Modelfiles — shared across all workspaces
-AGENTS_DIR = os.path.expanduser('~/.config/ollama-fs/agents')
+AGENTS_DIR = os.path.expanduser('~/.config/ollama-fsb/agents')
 
 # ---------------------------------------------------------------------------
 # Debug logger  (only active when --debug is passed)

@@ -88,11 +88,11 @@ if not os.path.exists(TARGET_DIR):
 DEBUG_LOG_PATH = os.path.join(TARGET_DIR, '.ollama-fs-debug.jsonl')
 
 # ---------------------------------------------------------------------------
-# Windows config dir  (%APPDATA%\ollama-fs\agents\)
-# Falls back to ~/.config equivalent if APPDATA is not set (unusual but safe).
+# Windows config dir  (%APPDATA%\ollama-fsb\agents\)
+# Falls back to ~ equivalent if APPDATA is not set (unusual but safe).
 # ---------------------------------------------------------------------------
 _appdata = os.environ.get('APPDATA') or os.path.expanduser('~')
-AGENTS_DIR = os.path.join(_appdata, 'ollama-fs', 'agents')
+AGENTS_DIR = os.path.join(_appdata, 'ollama-fsb', 'agents')
 
 # ---------------------------------------------------------------------------
 # Debug logger  (only active when --debug is passed)

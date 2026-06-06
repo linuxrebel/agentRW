@@ -83,7 +83,7 @@ os.chdir(CWD)
 SESSION_CWD = CWD
 
 DEBUG_LOG_PATH = os.path.join(CWD, '.ollama-fs-debug.jsonl')
-AGENTS_DIR = os.path.expanduser('~/.config/ollama-fs/agents')
+AGENTS_DIR = os.path.expanduser('~/.config/ollama-open/agents')
 
 # Shell command defaults
 SHELL_TIMEOUT_DEFAULT = 120

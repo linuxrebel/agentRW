@@ -1,9 +1,32 @@
-# First run: scaffolds Modelfile, builds agent, pings, opens REPL
-ollama-fs.py -m gemma4 -a openclaw ./my_project
+# First run — saves model as default
+cagent qwen2.5-coder:7b-instruct-q4_K_M --low-vram
 
-# Edit ~/.config/ollama-fs/agents/openclaw/Modelfile
-# Second run: detects Modelfile changed, rebuilds, pings, opens REPL
-ollama-fs.py -m gemma4 -a openclaw ./my_project
+# Subsequent runs — uses saved default
+cagent
 
-# No changes: skips build entirely, just pings and opens REPL
-ollama-fs.py -m gemma4 -a openclaw ./my_project
+# Switch model mid-run
+/model qwen2.5-coder:7b-instruct-q4_K_M
+
+# Show / change GPU layers
+/gpu-layers
+/gpu-layers 20
+
+# Shell commands run directly (no LLM)
+ls
+cat file.py
+git status
+
+# Shell passthrough with full control
+!python3 script.py
+
+# Navigate directories
+cd /path/to/project
+/pwd
+
+# Context management
+/compact
+/tokens
+/reset
+
+# Exit
+/bye   (or Ctrl+C / Ctrl+D)

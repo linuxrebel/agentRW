@@ -1,2 +1,0 @@
-ollama>=0.6.0
-colorama>=0.4.6

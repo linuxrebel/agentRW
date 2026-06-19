@@ -7,7 +7,7 @@ A terminal CLI coding assistant that gives a local [Ollama](https://ollama.com) 
 ## Requirements
 
 - Python 3.7+ (3.8+ recommended)
-- [Ollama](https://ollama.com) installed and running (`ollama serve`)
+- [https://ollama.com/download](https://ollama.com/download/windows) installed and running (`ollama serve`)
 - At least one model pulled (e.g. `ollama pull qwen2.5-coder:7b-instruct-q4_K_M`)
 - The `openai` Python package (`pip install openai`)
 - Optional: `pip install prompt_toolkit` for Alt+Enter multi-line input

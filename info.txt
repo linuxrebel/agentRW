@@ -16,6 +16,9 @@ ls
 cat file.py
 git status
 
+# Show GPU vs CPU memory usage (send at least one prompt first or output will be empty)
+/ops
+
 # Navigate directories
 cd /path/to/project
 /pwd

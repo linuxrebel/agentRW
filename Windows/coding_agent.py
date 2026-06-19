@@ -864,6 +864,15 @@ def run(model: str, gpu_layers: int | None = None,
             print(f"[CWD] {_agent_cwd[0]}")
             continue
 
+        if user.lower() == "/ops":
+            import subprocess as _sp
+            _r = _sp.run(["ollama", "ps"], capture_output=True, text=True)
+            if _r.stdout:
+                print(_r.stdout, end="")
+            if _r.stderr:
+                print(_r.stderr, end="")
+            continue
+
         # cd <path> — updates agent working directory; relative paths resolve against current cwd
         if user.lower().startswith("cd ") or user.lower().startswith("/cd "):
             parts = user.split()
@@ -1121,6 +1130,9 @@ SLASH COMMANDS  (type during session)
                      Example: cd ..
 
   /pwd               Show the agent's current working directory.
+
+  /ops               Show loaded Ollama models and GPU vs CPU memory usage.
+                     Runs: ollama ps
 
   /bye               Exit the agent  (also: exit, quit, /exit, /quit)
 

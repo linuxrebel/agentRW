@@ -24,6 +24,7 @@ Your system Python at {sys.executable} will not be changed — only this script 
 
 import inspect
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -86,9 +87,31 @@ RULE 12: Every user message contains a [CURRENT DIR: /some/path] tag. That is th
   WRONG:   tool: list_files({"path": "."})
 """
 
-YOU_COLOR = "\033[94m"
-ASSISTANT_COLOR = "\033[93m"
-RESET_COLOR = "\033[0m"
+def _init_ansi() -> bool:
+    """Enable ANSI color support. Returns True if colors are available."""
+    if sys.platform != "win32":
+        return True
+    # Try colorama first (pip install colorama)
+    try:
+        import colorama
+        colorama.init()
+        return True
+    except ImportError:
+        pass
+    # Fall back to enabling VT processing via ctypes (Windows 10 v1511+)
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        # ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+        return True
+    except Exception:
+        return False
+
+_ANSI = _init_ansi()
+YOU_COLOR       = "\033[94m" if _ANSI else ""
+ASSISTANT_COLOR = "\033[93m" if _ANSI else ""
+RESET_COLOR     = "\033[0m"  if _ANSI else ""
 
 _CHARS_PER_TOKEN = 4
 TOKEN_BUDGET = 8000  # max non-system tokens before proactive trim
@@ -841,6 +864,15 @@ def run(model: str, gpu_layers: int | None = None,
             print(f"[CWD] {_agent_cwd[0]}")
             continue
 
+        if user.lower() == "/ops":
+            import subprocess as _sp
+            _r = _sp.run(["ollama", "ps"], capture_output=True, text=True)
+            if _r.stdout:
+                print(_r.stdout, end="")
+            if _r.stderr:
+                print(_r.stderr, end="")
+            continue
+
         # cd <path> — updates agent working directory; relative paths resolve against current cwd
         if user.lower().startswith("cd ") or user.lower().startswith("/cd "):
             parts = user.split()
@@ -1099,6 +1131,9 @@ SLASH COMMANDS  (type during session)
 
   /pwd               Show the agent's current working directory.
 
+  /ops               Show loaded Ollama models and GPU vs CPU memory usage.
+                     Runs: ollama ps
+
   /bye               Exit the agent  (also: exit, quit, /exit, /quit)
 
 ─────────────────────────────────────────────────────
@@ -1159,7 +1194,10 @@ RECOMMENDED MODELS FOR 4 GB VRAM
 """)
 
 
-_CONFIG_PATH = Path.home() / ".config" / "coding_agent" / "config.json"
+if sys.platform == "win32":
+    _CONFIG_PATH = Path(os.environ.get("APPDATA", Path.home())) / "coding_agent" / "config.json"
+else:
+    _CONFIG_PATH = Path.home() / ".config" / "coding_agent" / "config.json"
 
 
 def _load_config() -> dict:

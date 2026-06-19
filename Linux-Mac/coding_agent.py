@@ -873,6 +873,15 @@ def run(model: str, gpu_layers: int | None = None,
                 print(_r.stderr, end="")
             continue
 
+        if user.lower() == "/olist":
+            import subprocess as _sp
+            _r = _sp.run(["ollama", "list"], capture_output=True, text=True)
+            if _r.stdout:
+                print(_r.stdout, end="")
+            if _r.stderr:
+                print(_r.stderr, end="")
+            continue
+
         # cd <path> — updates agent working directory; relative paths resolve against current cwd
         if user.lower().startswith("cd ") or user.lower().startswith("/cd "):
             parts = user.split()
@@ -1133,6 +1142,10 @@ SLASH COMMANDS  (type during session)
 
   /ops               Show loaded Ollama models and GPU vs CPU memory usage.
                      Runs: ollama ps
+                     Note: requires at least one prompt sent first or output will be empty.
+
+  /olist             List all locally installed Ollama models.
+                     Runs: ollama list
 
   /bye               Exit the agent  (also: exit, quit, /exit, /quit)
 

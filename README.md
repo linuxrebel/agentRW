@@ -111,6 +111,7 @@ grep -r "TODO" .
 | `cd <path>` | Change working directory |
 | `/pwd` | Show current working directory |
 | `/ops` | Show loaded models and GPU vs CPU memory split (`ollama ps`) — requires at least one prompt sent first |
+| `/olist` | List all locally installed Ollama models (`ollama list`) |
 | `/bye` | Exit (also: Ctrl+C, Ctrl+D) |
 
 ---

@@ -21,14 +21,14 @@ A terminal CLI coding assistant that gives a local [Ollama](https://ollama.com) 
 ```bash
 pip install -r Linux-Mac/requirements.txt
 chmod +x Linux-Mac/coding_agent.py
-ln -s /path/to/Linux-Mac/coding_agent.py ~/.local/bin/cagent
+ln -s /path/to/Linux-Mac/coding_agent.py ~/.local/bin/coding_agent
 ```
 
 ### Windows
 
 ```powershell
 pip install -r Windows\requirements.txt
-python Windows\coding_agent.py qwen2.5-coder:7b-instruct-q4_K_M
+python Windows\coding_agent.py <model-name>
 ```
 
 To call it without the `.py` extension from anywhere, create a `.bat` wrapper:
@@ -38,7 +38,7 @@ To call it without the `.py` extension from anywhere, create a `.bat` wrapper:
 python C:\path\to\coding_agent.py %*
 ```
 
-Save as `cagent.bat` somewhere on your `PATH`.
+Save as `coding_agent.bat` somewhere on your `PATH`.
 
 Config is stored in `%APPDATA%\coding_agent\config.json`.
 
@@ -52,17 +52,17 @@ For older consoles, `colorama` (included in `requirements.txt`) handles it.
 The first time you run without a model name, it will prompt you:
 
 ```
-cagent
+coding_agent
 First run: please provide a model name and any arguments. Run --help for options.
 ```
 
 Pass a model name — it gets saved as your default:
 
 ```bash
-cagent qwen2.5-coder:7b-instruct-q4_K_M --low-vram
+coding_agent <model-name> --low-vram
 ```
 
-After that, `cagent` alone uses your saved default.
+After that, `coding_agent` alone uses your saved default.
 
 ---
 
@@ -70,7 +70,6 @@ After that, `cagent` alone uses your saved default.
 
 ```
 coding_agent.py [MODEL] [OPTIONS]
-cagent [MODEL] [OPTIONS]
 ```
 
 | Option | Description |
@@ -136,19 +135,6 @@ The model has access to these tools automatically:
 - **Truncation guard**: refuses to write if new content is < 60% of original size
 - **Syntax check**: `.py` files are compiled before touching disk — syntax errors are rejected
 - **No privilege escalation**: `run_command` blocks `sudo`, `su`, `doas`, `pkexec`, `runuser`
-
----
-
-## Recommended Models (4 GB VRAM)
-
-| Model | Notes |
-|-------|-------|
-| `qwen2.5-coder:7b-instruct-q4_K_M` | Best instruction-following, good code quality |
-| `phi4-mini` | Fast, small, decent code quality |
-| `starcoder2:3b` | Tiny, pure code completion |
-| `deepseek-coder-v2:16b` | MoE architecture — low active params, fits 4 GB |
-
-Run all with `--low-vram` on 4 GB VRAM.
 
 ---
 

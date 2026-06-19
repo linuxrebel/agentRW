@@ -1,11 +1,11 @@
 # First run — saves model as default
-cagent qwen2.5-coder:7b-instruct-q4_K_M --low-vram
+coding_agent <model-name> --low-vram
 
 # Subsequent runs — uses saved default
-cagent
+coding_agent
 
 # Switch model mid-run
-/model qwen2.5-coder:7b-instruct-q4_K_M
+/model <model-name>
 
 # Show / change GPU layers
 /gpu-layers
@@ -15,9 +15,6 @@ cagent
 ls
 cat file.py
 git status
-
-# Shell passthrough with full control
-!python3 script.py
 
 # Navigate directories
 cd /path/to/project

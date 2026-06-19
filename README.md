@@ -26,7 +26,24 @@ ln -s /path/to/Linux-Mac/coding_agent.py ~/.local/bin/cagent
 
 ### Windows
 
-Windows support is in progress. The core script requires minor adjustments for Windows path handling and ANSI color support. Contributions welcome.
+```powershell
+pip install -r Windows\requirements.txt
+python Windows\coding_agent.py qwen2.5-coder:7b-instruct-q4_K_M
+```
+
+To call it without the `.py` extension from anywhere, create a `.bat` wrapper:
+
+```bat
+@echo off
+python C:\path\to\coding_agent.py %*
+```
+
+Save as `cagent.bat` somewhere on your `PATH`.
+
+Config is stored in `%APPDATA%\coding_agent\config.json`.
+
+ANSI colors work automatically in Windows Terminal and PowerShell 7.
+For older consoles, `colorama` (included in `requirements.txt`) handles it.
 
 ---
 

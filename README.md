@@ -112,7 +112,7 @@ grep -r "TODO" .
 | `/pwd` | Show current working directory |
 | `/ops` | Show loaded models and GPU vs CPU memory split (`ollama ps`) — requires at least one prompt sent first |
 | `/olist` | List all locally installed Ollama models (`ollama list`) |
-| `/updte` | Check if Ollama is up to date — compares installed version against latest GitHub release |
+| `/update` | Check if Ollama is up to date — compares installed version against latest GitHub release |
 | `/bye` | Exit (also: Ctrl+C, Ctrl+D) |
 
 ---

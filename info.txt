@@ -20,7 +20,7 @@ git status
 /ops
 
 # Check if Ollama needs an update
-/updte
+/update
 
 # List all locally installed models
 /olist

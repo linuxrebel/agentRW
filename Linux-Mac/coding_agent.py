@@ -864,6 +864,10 @@ def run(model: str, gpu_layers: int | None = None,
             print(f"[CWD] {_agent_cwd[0]}")
             continue
 
+        if user.lower() in {"/help", "-h", "--help"}:
+            print_help()
+            continue
+
         if user.lower() == "/ops":
             import subprocess as _sp
             _r = _sp.run(["ollama", "ps"], capture_output=True, text=True)
@@ -882,11 +886,11 @@ def run(model: str, gpu_layers: int | None = None,
                 print(_r.stderr, end="")
             continue
 
-        if user.lower() == "/updte":
-            import subprocess as _sp, urllib.request as _ur, json as _json, re as _re
+        if user.lower() == "/update":
+            import subprocess as _sp, urllib.request as _ur, json as _json, re as _vre
             try:
                 _vr = _sp.run(["ollama", "--version"], capture_output=True, text=True)
-                _local = _re.search(r"[\d.]+", _vr.stdout or "")
+                _local = _vre.search(r"[\d.]+", _vr.stdout or "")
                 _local = _local.group(0) if _local else "unknown"
                 with _ur.urlopen("https://api.github.com/repos/ollama/ollama/releases/latest", timeout=8) as _resp:
                     _latest = _json.loads(_resp.read())["tag_name"].lstrip("v")
@@ -1163,7 +1167,7 @@ SLASH COMMANDS  (type during session)
   /olist             List all locally installed Ollama models.
                      Runs: ollama list
 
-  /updte             Check if Ollama is up to date.
+  /update             Check if Ollama is up to date.
                      Compares installed version against latest GitHub release.
                      Prints "version is current" or "update needed".
 

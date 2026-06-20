@@ -102,6 +102,7 @@ grep -r "TODO" .
 
 | Command | Description |
 |---------|-------------|
+| `/help` | Show all available commands and tools |
 | `/model [name]` | Show or switch the active model |
 | `/gpu-layers [N]` | Show or set GPU layers live |
 | `/low-vram` | Apply 4 GB preset mid-session |

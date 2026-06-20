@@ -864,6 +864,10 @@ def run(model: str, gpu_layers: int | None = None,
             print(f"[CWD] {_agent_cwd[0]}")
             continue
 
+        if user.lower() in {"/help", "-h", "--help"}:
+            print_help()
+            continue
+
         if user.lower() == "/ops":
             import subprocess as _sp
             _r = _sp.run(["ollama", "ps"], capture_output=True, text=True)

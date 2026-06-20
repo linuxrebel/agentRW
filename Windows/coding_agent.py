@@ -882,6 +882,22 @@ def run(model: str, gpu_layers: int | None = None,
                 print(_r.stderr, end="")
             continue
 
+        if user.lower() == "/updte":
+            import subprocess as _sp, urllib.request as _ur, json as _json, re as _re
+            try:
+                _vr = _sp.run(["ollama", "--version"], capture_output=True, text=True)
+                _local = _re.search(r"[\d.]+", _vr.stdout or "")
+                _local = _local.group(0) if _local else "unknown"
+                with _ur.urlopen("https://api.github.com/repos/ollama/ollama/releases/latest", timeout=8) as _resp:
+                    _latest = _json.loads(_resp.read())["tag_name"].lstrip("v")
+                if _local == _latest:
+                    print(f"[Ollama] Version is current ({_local})")
+                else:
+                    print(f"[Ollama] Update needed — installed: {_local}  latest: {_latest}")
+            except Exception as _e:
+                print(f"[Ollama] Check failed: {_e}")
+            continue
+
         # cd <path> — updates agent working directory; relative paths resolve against current cwd
         if user.lower().startswith("cd ") or user.lower().startswith("/cd "):
             parts = user.split()
@@ -1146,6 +1162,10 @@ SLASH COMMANDS  (type during session)
 
   /olist             List all locally installed Ollama models.
                      Runs: ollama list
+
+  /updte             Check if Ollama is up to date.
+                     Compares installed version against latest GitHub release.
+                     Prints "version is current" or "update needed".
 
   /bye               Exit the agent  (also: exit, quit, /exit, /quit)
 

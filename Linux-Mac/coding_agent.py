@@ -865,7 +865,12 @@ def run(model: str, gpu_layers: int | None = None,
             continue
 
         if user.lower() in {"/help", "-h", "--help"}:
-            print_help()
+            print(
+                "/help       /model      /gpu-layers  /low-vram\n"
+                "/compact    /tokens     /reset       /pwd\n"
+                "/ops        /olist      /update      /bye\n"
+                "cd <path>"
+            )
             continue
 
         if user.lower() == "/ops":

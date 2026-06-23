@@ -903,17 +903,24 @@ def run(model: str, gpu_layers: int | None = None,
             continue
 
         if user.lower() == "/update":
-            import subprocess as _sp, urllib.request as _ur, json as _json, re as _vre
+            import subprocess as _sp, json as _json, re as _vre
             try:
-                _vr = _sp.run(["ollama", "--version"], capture_output=True, text=True)
+                _vr = _sp.run(["ollama", "--version"], capture_output=True, text=True, timeout=5)
                 _local = _vre.search(r"[\d.]+", _vr.stdout or "")
                 _local = _local.group(0) if _local else "unknown"
-                with _ur.urlopen("https://api.github.com/repos/ollama/ollama/releases/latest", timeout=8) as _resp:
-                    _latest = _json.loads(_resp.read())["tag_name"].lstrip("v")
-                if _local == _latest:
-                    print(f"[Ollama] Version is current ({_local})")
+                _cr = _sp.run(
+                    ["curl", "-sf", "--max-time", "8",
+                     "https://api.github.com/repos/ollama/ollama/releases/latest"],
+                    capture_output=True, text=True, timeout=10
+                )
+                if _cr.returncode != 0 or not _cr.stdout:
+                    print("[Ollama] Version check failed — no network or curl unavailable.")
                 else:
-                    print(f"[Ollama] Update needed — installed: {_local}  latest: {_latest}")
+                    _latest = _json.loads(_cr.stdout)["tag_name"].lstrip("v")
+                    if _local == _latest:
+                        print(f"[Ollama] Version is current ({_local})")
+                    else:
+                        print(f"[Ollama] Update needed — installed: {_local}  latest: {_latest}")
             except Exception as _e:
                 print(f"[Ollama] Check failed: {_e}")
             continue

@@ -930,9 +930,12 @@ def run(model: str, gpu_layers: int | None = None,
 
         # Shell command passthrough — if first word is an executable in PATH, run it directly
         # cd is handled above (needs agent state). Everything else: universal passthrough.
+        # Blocklist: binaries that exist on most systems but are common English words —
+        # they misbehave (hang/block/no-op) when given natural language as arguments.
+        _PASSTHROUGH_SKIP = {"read", "write", "wait", "test", "true", "false"}
         import shutil as _shutil, subprocess as _sp
         _first = user.split()[0] if user.split() else ""
-        if _first and _shutil.which(_first):
+        if _first and _first not in _PASSTHROUGH_SKIP and _shutil.which(_first):
             try:
                 result = _sp.run(
                     user, shell=True, capture_output=True, text=True,

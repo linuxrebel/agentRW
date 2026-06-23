@@ -817,8 +817,16 @@ def run(model: str, gpu_layers: int | None = None,
         if user.lower().startswith("/model"):
             parts = user.split(None, 1)
             if len(parts) == 2:
-                model = parts[1].strip()
-                print(f"[Model] Switched to: {model}")
+                import subprocess as _sp
+                _new_model = parts[1].strip()
+                _ol = _sp.run(["ollama", "list"], capture_output=True, text=True)
+                _known = [ln.split()[0] for ln in _ol.stdout.splitlines()[1:] if ln.strip()]
+                if _new_model in _known:
+                    model = _new_model
+                    print(f"[Model] Switched to: {model}. Switch will complete once you run the first command with this model.")
+                else:
+                    print(f"[Model] Not found locally: {_new_model}")
+                    print(f"[Model] Run `ollama pull {_new_model}` to download it, or /olist to see available models.")
             else:
                 print(f"[Model] Current model: {model}")
             continue
@@ -876,7 +884,10 @@ def run(model: str, gpu_layers: int | None = None,
         if user.lower() == "/ops":
             import subprocess as _sp
             _r = _sp.run(["ollama", "ps"], capture_output=True, text=True)
-            if _r.stdout:
+            _lines = [l for l in _r.stdout.splitlines() if l.strip()]
+            if len(_lines) <= 1:
+                print("[Ops] No models currently loaded — send a prompt first to load the model into memory.")
+            else:
                 print(_r.stdout, end="")
             if _r.stderr:
                 print(_r.stderr, end="")

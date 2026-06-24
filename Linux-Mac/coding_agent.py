@@ -70,6 +70,14 @@ RULE 8: NEVER ask for approval, permission, or confirmation before making change
   WRONG: "Here is what I will do: ..."
   CORRECT: tool: write_file({"filename":"...","content":"..."})
 
+RULE 8c: When writing Python code that contains newlines inside strings, ALWAYS use double-quoted strings ("...") or triple-quoted strings — NEVER single-quoted strings ('...'). Single-quoted strings with \\n become unterminated when the JSON content is decoded.
+  WRONG: print(f'Line 1\nLine 2')
+  CORRECT: print(f"Line 1\nLine 2")
+
+RULE 8b: NEVER print file content to the terminal. If the user asks you to create, write, or save a file — use write_file. Printing the code as a response is WRONG.
+  User: "write a script to /home/user/foo.py" → tool: write_file({"filename":"/home/user/foo.py","content":"..."})
+  WRONG: responding with the code block in chat and not calling write_file.
+
 RULE 9: run_command runs as the current user only. NEVER use sudo, su, doas, pkexec, or runuser. NEVER attempt privilege escalation. The tool will block and report an error if you try.
 
 RULE 10: When the user asks you to run a shell command (ls, cat, grep, git, python3, make, etc.), use run_command to execute it directly. Do NOT map shell commands to file tools. Do NOT recreate shell output in JSON. run_command returns real shell stdout/stderr — use that.
@@ -117,7 +125,7 @@ _CHARS_PER_TOKEN = 4
 TOKEN_BUDGET = 8000  # max non-system tokens before proactive trim
 
 LOW_VRAM_PRESET = {
-    "max_tokens": 512,
+    "max_tokens": 1800,
     "num_ctx":    2048,
     "token_budget": 2000,
 }
@@ -337,10 +345,13 @@ def write_file_tool(filename: str, content: str) -> Dict[str, Any]:
             try:
                 compile(content, str(p), "exec")
             except SyntaxError as e:
-                return {
-                    "error": "syntax_error",
-                    "hint": f"New content has a Python syntax error at line {e.lineno}: {e.msg}. File NOT written.",
-                }
+                _hint = (
+                    f"New content has a Python syntax error at line {e.lineno}: {e.msg}. File NOT written. "
+                    "Common cause: a \\n escape inside a single-quoted string becomes a real newline, "
+                    "breaking f-strings. Fix: use double-quoted strings (\"...\") or triple-quoted strings (\"\"\"...\"\"\") "
+                    "instead of single-quoted strings when the content contains \\n escapes."
+                )
+                return {"error": "syntax_error", "hint": _hint}
 
         p.write_text(content, encoding="utf-8")
         return {"path": str(p), "action": "written", "backup": str(bak) if existed else None}

@@ -93,6 +93,10 @@ RULE 12: Every user message contains a [CURRENT DIR: /some/path] tag. That is th
   CORRECT: tool: list_files({"path": "/mnt/data/git/AI"})
   WRONG:   tool: list_files({"path": "%CURRENT_DIR%"})
   WRONG:   tool: list_files({"path": "."})
+
+RULE 13: Write minimum code. No unrequested features, abstractions, or error handling for impossible scenarios. If the task can be done in 20 lines, don't write 100.
+
+RULE 14: When editing existing code, touch ONLY what the user asked to change. Do not improve adjacent code, reformat, rename, or refactor things that aren't broken. Match the existing style even if you'd do it differently.
 """
 
 def _init_ansi() -> bool:

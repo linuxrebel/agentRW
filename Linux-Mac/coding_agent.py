@@ -93,10 +93,6 @@ RULE 12: Every user message contains a [CURRENT DIR: /some/path] tag. That is th
   CORRECT: tool: list_files({"path": "/mnt/data/git/AI"})
   WRONG:   tool: list_files({"path": "%CURRENT_DIR%"})
   WRONG:   tool: list_files({"path": "."})
-
-RULE 13: Write minimum code. No unrequested features, abstractions, or error handling for impossible scenarios. If the task can be done in 20 lines, don't write 100.
-
-RULE 14: When editing existing code, touch ONLY what the user asked to change. Do not improve adjacent code, reformat, rename, or refactor things that aren't broken. Match the existing style even if you'd do it differently.
 """
 
 def _init_ansi() -> bool:
@@ -323,9 +319,6 @@ def write_file_tool(filename: str, content: str) -> Dict[str, Any]:
     Use this when you need to rewrite most of a file. content must be complete, valid code."""
     p = resolve_abs_path(filename)
     try:
-        if not content or not content.strip():
-            return {"error": "empty_content", "hint": "content is empty — provide the full file content."}
-
         bak = p.with_suffix(p.suffix + ".bak")
         existed = p.exists()
 
@@ -1064,8 +1057,7 @@ def run(model: str, gpu_layers: int | None = None,
             for name, args in tools:
                 fn = TOOL_REGISTRY.get(name)
                 if not fn:
-                    result = {"error": "unknown_tool", "name": name,
-                              "hint": f"Available tools: {list(TOOL_REGISTRY.keys())}"}
+                    result = {"error": "unknown_tool", "name": name}
                     turn_had_error = True
                 else:
                     # Validate required args before calling to catch garbage parses
@@ -1078,22 +1070,13 @@ def run(model: str, gpu_layers: int | None = None,
                                   "hint": f"Required: {missing}. Got: {list(args.keys())}"}
                         turn_had_error = True
                     else:
-                        # Strip unknown kwargs — some models append extra args the fn doesn't accept
-                        sig = inspect.signature(fn)
-                        valid_params = set(sig.parameters.keys())
-                        filtered = {k: v for k, v in args.items() if k in valid_params}
-                        if len(filtered) != len(args):
-                            dropped = set(args) - valid_params
-                            print(f"[warn] {name}: ignoring unknown args {sorted(dropped)}")
-                        print(f"[tool] {name} {filtered}")
+                        print(f"[tool] {name} {args}")
                         try:
-                            result = fn(**filtered)
+                            result = fn(**args)
                             if "error" in result:
                                 turn_had_error = True
                         except TypeError as e:
-                            expected = list(sig.parameters.keys())
-                            result = {"error": f"bad_arguments: {e}",
-                                      "hint": f"Expected args for {name}: {expected}. Got: {list(args.keys())}"}
+                            result = {"error": f"bad_arguments: {e}"}
                             turn_had_error = True
                         except Exception as e:
                             result = {"error": str(e)}

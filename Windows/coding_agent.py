@@ -323,6 +323,9 @@ def write_file_tool(filename: str, content: str) -> Dict[str, Any]:
     Use this when you need to rewrite most of a file. content must be complete, valid code."""
     p = resolve_abs_path(filename)
     try:
+        if not content or not content.strip():
+            return {"error": "empty_content", "hint": "content is empty — provide the full file content."}
+
         bak = p.with_suffix(p.suffix + ".bak")
         existed = p.exists()
 

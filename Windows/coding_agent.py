@@ -1064,7 +1064,8 @@ def run(model: str, gpu_layers: int | None = None,
             for name, args in tools:
                 fn = TOOL_REGISTRY.get(name)
                 if not fn:
-                    result = {"error": "unknown_tool", "name": name}
+                    result = {"error": "unknown_tool", "name": name,
+                              "hint": f"Available tools: {list(TOOL_REGISTRY.keys())}"}
                     turn_had_error = True
                 else:
                     # Validate required args before calling to catch garbage parses
@@ -1077,13 +1078,22 @@ def run(model: str, gpu_layers: int | None = None,
                                   "hint": f"Required: {missing}. Got: {list(args.keys())}"}
                         turn_had_error = True
                     else:
-                        print(f"[tool] {name} {args}")
+                        # Strip unknown kwargs — some models append extra args the fn doesn't accept
+                        sig = inspect.signature(fn)
+                        valid_params = set(sig.parameters.keys())
+                        filtered = {k: v for k, v in args.items() if k in valid_params}
+                        if len(filtered) != len(args):
+                            dropped = set(args) - valid_params
+                            print(f"[warn] {name}: ignoring unknown args {sorted(dropped)}")
+                        print(f"[tool] {name} {filtered}")
                         try:
-                            result = fn(**args)
+                            result = fn(**filtered)
                             if "error" in result:
                                 turn_had_error = True
                         except TypeError as e:
-                            result = {"error": f"bad_arguments: {e}"}
+                            expected = list(sig.parameters.keys())
+                            result = {"error": f"bad_arguments: {e}",
+                                      "hint": f"Expected args for {name}: {expected}. Got: {list(args.keys())}"}
                             turn_had_error = True
                         except Exception as e:
                             result = {"error": str(e)}

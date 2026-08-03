@@ -95,7 +95,7 @@ The model calls these itself:
 | Tool | Description |
 |------|-------------|
 | `read_file` | Read a file (with line range support) |
-| `write_file` | Overwrite a file, backing up to `.bak` first |
+| `write_file` | Overwrite a file (scoped to allowed dirs), backing up to `.bak` first |
 | `edit_file` | Patch a file by replacing a string match |
 | `search_file` | Case-insensitive grep |
 | `list_files` | Directory listing |
@@ -103,12 +103,33 @@ The model calls these itself:
 
 ---
 
-## File Safety
+## Safety
 
-- **Backup**: `.bak` written once on first modification — the original survives across retries.
-- **No privilege escalation**: `run_command` blocks `sudo`, `su`, `doas`, `pkexec`, `runuser`.
+The agent runs a local model with your privileges. Anything it reads — a file, a
+command's output — becomes text the model acts on, so a file containing
+instructions can try to steer it. Two controls exist for that:
 
-The agent is a harness, not a critic: `write_file` does not vet the content it is handed. It writes what the model produced and leaves judging the result to you. A file on disk with a bug is more useful than a refusal and no file.
+- **Writes are scoped.** `write_file` and `edit_file` only write under the working
+  directory. `~/.bashrc`, `~/.ssh/`, and the script itself are out of reach. Add
+  directories with `--allow-write DIR` (repeatable); `cd` moves the scope.
+- **Commands are confirmed.** Every `run_command` the model proposes is shown to
+  you first. `a` approves the rest of the session, `--yes` skips the prompt
+  entirely. Declining is the only thing standing between a poisoned file and
+  execution, so read what you approve.
+
+Lesser guarantees:
+
+- **Backup**: `.bak` written once on first modification, owner-only (`0600`), so
+  the copy does not widen access to a file's contents.
+- **No accidental sudo**: `run_command` rejects `sudo`, `su`, `doas`, `pkexec`,
+  `runuser`. This catches the model reaching for them by habit. It is **not** a
+  security boundary — the command runs under a shell, which expands the string
+  after that check, so anything deliberate gets through. The confirmation prompt
+  is the real control.
+
+`write_file` does not vet the *content* it is handed — it is a harness, not a
+critic. It writes what the model produced and leaves judging the result to you.
+A file on disk with a bug is more useful than a refusal and no file.
 
 ---
 

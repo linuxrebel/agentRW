@@ -3,8 +3,5 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Local backup files (e.g. ollama-fs.py.bak)
+# Backups written by write_file / edit_file
 *.bak
-
-# Runtime debug logs (created in the agent's starting directory)
-.ollama-fs-debug.jsonl

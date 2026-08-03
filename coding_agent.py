@@ -11,7 +11,6 @@ import inspect
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -269,19 +268,11 @@ TOOL_REGISTRY = {
 # -----------------------------
 # Prompt builder
 # -----------------------------
-def tool_repr(name: str) -> str:
-    fn = TOOL_REGISTRY[name]
-    return f"""
-{name}
-{inspect.signature(fn)}
-{fn.__doc__}
-"""
-
-
 def build_prompt() -> str:
-    tools = ""
-    for name in TOOL_REGISTRY:
-        tools += tool_repr(name) + "\n----------------\n"
+    tools = "".join(
+        f"\n{name}\n{inspect.signature(fn)}\n{fn.__doc__}\n\n----------------\n"
+        for name, fn in TOOL_REGISTRY.items()
+    )
     return SYSTEM_PROMPT.replace("{{tool_list_repr}}", tools) \
                         .replace("{{", "{").replace("}}", "}")
 

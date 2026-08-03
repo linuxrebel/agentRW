@@ -2,15 +2,21 @@
 
 A terminal CLI coding assistant that gives a local [Ollama](https://ollama.com) model interactive read/write/execute access to your filesystem — without ever leaving your terminal or sending data to the cloud.
 
+One script, all platforms. Windows-specific behavior (config location, ANSI colors) is handled internally.
+
 ---
 
 ## Requirements
 
-- Python 3.7+ (3.8+ recommended)
-- Ollama should be installed and running (See [https://ollama.com/download](https://ollama.com/download) for instructions on how to do this)
-- At least one model pulled (go to [https://ollama.com/library?sort=newest](https://ollama.com/library?sort=newest) to find models)
-- The `openai` Python package (`pip install openai`)
-- Optional: `pip install prompt_toolkit` for Alt+Enter multi-line input
+- Python 3.10+
+- Ollama installed and running — see [ollama.com/download](https://ollama.com/download)
+- At least one model pulled — browse [ollama.com/library](https://ollama.com/library?sort=newest)
+
+```bash
+pip install -r requirements.txt
+```
+
+`prompt_toolkit` is optional (Alt+Enter multi-line input); the agent falls back to plain `input()` without it. `colorama` installs on Windows only.
 
 ---
 
@@ -19,50 +25,43 @@ A terminal CLI coding assistant that gives a local [Ollama](https://ollama.com) 
 ### Linux / macOS
 
 ```bash
-pip install -r Linux-Mac/requirements.txt
-chmod +x Linux-Mac/coding_agent.py
-ln -s /path/to/Linux-Mac/coding_agent.py ~/.local/bin/coding_agent
+chmod +x coding_agent.py
+ln -s "$PWD/coding_agent.py" ~/.local/bin/coding_agent
 ```
 
 ### Windows
 
 ```powershell
-pip install -r Windows\requirements.txt
-python Windows\coding_agent.py <model-name>
+python coding_agent.py <model-name>
 ```
 
-To call it without the `.py` extension from anywhere, create a `.bat` wrapper:
+To call it without the `.py` extension, save a `coding_agent.bat` somewhere on your `PATH`:
 
 ```bat
 @echo off
 python C:\path\to\coding_agent.py %*
 ```
 
-Save as `coding_agent.bat` somewhere on your `PATH`.
-
-Config is stored in `%APPDATA%\coding_agent\config.json`.
-
-ANSI colors work automatically in Windows Terminal and PowerShell 7.
-For older consoles, `colorama` (included in `requirements.txt`) handles it.
+Config lives in `%APPDATA%\coding_agent\config.json` on Windows, `~/.config/coding_agent/config.json` elsewhere.
 
 ---
 
 ## First Run
 
-The first time you run without a model name, it will prompt you:
+Run without a model name and it will ask for one:
 
 ```
-coding_agent
+$ coding_agent
 First run: please provide a model name and any arguments. Run --help for options.
 ```
 
-Pass a model name — it gets saved as your default:
+Pass a model — it gets saved as your default:
 
 ```bash
 coding_agent <model-name> --low-vram
 ```
 
-After that, `coding_agent` alone uses your saved default.
+After that, `coding_agent` alone uses the saved default. Passing a different model prompts you to update it.
 
 ---
 
@@ -72,15 +71,7 @@ After that, `coding_agent` alone uses your saved default.
 coding_agent.py [MODEL] [OPTIONS]
 ```
 
-| Option | Description |
-|--------|-------------|
-| `MODEL` | Ollama model tag (saved as default on first use) |
-| `--gpu-layers N` | GPU layers (0 = CPU only; auto-halved on OOM) |
-| `--num-ctx N` | KV cache context window size |
-| `--max-tokens N` | Max output tokens per reply (default: 2000) |
-| `--low-vram` | 4 GB VRAM preset: num_ctx=2048, max_tokens=512 |
-| `--set-default MODEL` | Save a new default model to config and exit |
-| `-h`, `--help` | Full usage reference |
+Run `coding_agent --help` for the full flag reference, and `/help` inside a session for the slash-command list. Both print from the source, so they never drift.
 
 ---
 
@@ -90,7 +81,6 @@ Any command found in your `$PATH` typed at the prompt runs directly — no LLM i
 
 ```
 ls
-cat file.py
 git status
 python3 script.py
 grep -r "TODO" .
@@ -98,34 +88,14 @@ grep -r "TODO" .
 
 ---
 
-## Slash Commands
-
-| Command | Description |
-|---------|-------------|
-| `/help` | Show all available commands and tools |
-| `/model [name]` | Show or switch the active model |
-| `/gpu-layers [N]` | Show or set GPU layers live |
-| `/low-vram` | Apply 4 GB preset mid-session |
-| `/compact` | Compress context to free token budget |
-| `/tokens` | Show estimated token count |
-| `/reset` | Wipe conversation history |
-| `cd <path>` | Change working directory |
-| `/pwd` | Show current working directory |
-| `/ops` | Show loaded models and GPU vs CPU memory split (`ollama ps`) — requires at least one prompt sent first |
-| `/olist` | List all locally installed Ollama models (`ollama list`) |
-| `/update` | Check if Ollama is up to date — compares installed version against latest GitHub release |
-| `/bye` | Exit (also: Ctrl+C, Ctrl+D) |
-
----
-
 ## Model Tools
 
-The model has access to these tools automatically:
+The model calls these itself:
 
 | Tool | Description |
 |------|-------------|
 | `read_file` | Read a file (with line range support) |
-| `write_file` | Overwrite a file (truncation guard + .bak + syntax check) |
+| `write_file` | Overwrite a file, backing up to `.bak` first |
 | `edit_file` | Patch a file by replacing a string match |
 | `search_file` | Case-insensitive grep |
 | `list_files` | Directory listing |
@@ -135,13 +105,13 @@ The model has access to these tools automatically:
 
 ## File Safety
 
-- **Backup**: `.bak` written once on first modification — original preserved across all retries
-- **Truncation guard**: refuses to write if new content is < 60% of original size
-- **Syntax check**: `.py` files are compiled before touching disk — syntax errors are rejected
-- **No privilege escalation**: `run_command` blocks `sudo`, `su`, `doas`, `pkexec`, `runuser`
+- **Backup**: `.bak` written once on first modification — the original survives across retries.
+- **No privilege escalation**: `run_command` blocks `sudo`, `su`, `doas`, `pkexec`, `runuser`.
+
+The agent is a harness, not a critic: `write_file` does not vet the content it is handed. It writes what the model produced and leaves judging the result to you. A file on disk with a bug is more useful than a refusal and no file.
 
 ---
 
 ## Quitting
 
-Type `/bye`, `exit`, or `quit` at the prompt, or press `Ctrl+C` / `Ctrl+D`.
+Type `/bye`, `exit`, or `quit`, or press `Ctrl+C` / `Ctrl+D`.

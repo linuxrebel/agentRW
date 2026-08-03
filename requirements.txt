@@ -1,0 +1,7 @@
+openai>=1.0.0
+
+# Optional: Alt+Enter multi-line input. Falls back to input() if absent.
+prompt_toolkit>=3.0.0
+
+# Windows only: ANSI colors on consoles that lack native VT support.
+colorama>=0.4.6; sys_platform == "win32"

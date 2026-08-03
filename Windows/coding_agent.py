@@ -22,6 +22,7 @@ Your system Python at {sys.executable} will not be changed — only this script 
 """)
     sys.exit(1)
 
+import ast
 import inspect
 import json
 import os
@@ -260,36 +261,14 @@ def write_file_tool(filename: str, content: str) -> Dict[str, Any]:
         bak = p.with_suffix(p.suffix + ".bak")
         existed = p.exists()
 
-        if existed:
-            original = p.read_text(encoding="utf-8")
-            if not bak.exists():
-                bak.write_text(original, encoding="utf-8")
+        if existed and not bak.exists():
+            bak.write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
 
-            if len(content.strip()) < len(original.strip()) * 0.6:
-                return {
-                    "error": "suspicious_truncation",
-                    "hint": (
-                        f"New content ({len(content)} chars) is less than 60% of original "
-                        f"({len(original)} chars). Refusing to write — likely truncated output. "
-                        "Provide the COMPLETE file content or use edit_file for partial changes."
-                    ),
-                    "backup": str(bak),
-                }
-
-        if p.suffix == ".py":
-            try:
-                compile(content, str(p), "exec")
-            except SyntaxError as e:
-                _hint = (
-                    f"New content has a Python syntax error at line {e.lineno}: {e.msg}. File NOT written. "
-                    "Common cause: a \\n escape inside a single-quoted string becomes a real newline, "
-                    "breaking f-strings. Fix: use double-quoted strings (\"...\") or triple-quoted strings (\"\"\"...\"\"\") "
-                    "instead of single-quoted strings when the content contains \\n escapes."
-                )
-                return {"error": "syntax_error", "hint": _hint}
-
+        # Harness, not critic: never judge the content, just write it.
+        # The .bak above is the safety net.
         p.write_text(content, encoding="utf-8")
-        return {"path": str(p), "action": "written", "backup": str(bak) if existed else None}
+        return {"path": str(p), "action": "written",
+                "backup": str(bak) if existed else None}
     except PermissionError:
         return {"error": "permission_denied", "path": str(p)}
     except Exception as e:
@@ -392,6 +371,11 @@ def _fix_json_newlines(s: str) -> str:
     return ''.join(result)
 
 
+def _KEY(name: str) -> str:
+    """Regex for a dict key in any quote style (JSON or Python literal)."""
+    return r'["\']{1,3}' + name + r'["\']{1,3}\s*:\s*'
+
+
 def _try_targeted_extract(tool_name: str, args_str: str) -> Dict[str, Any]:
     """Greedy extraction for known tool shapes when JSON and kwargs both fail.
     Uses last-quote anchoring so embedded quotes in content still parse."""
@@ -399,43 +383,63 @@ def _try_targeted_extract(tool_name: str, args_str: str) -> Dict[str, Any]:
         return (s.replace('\\n', '\n').replace('\\t', '\t')
                  .replace('\\r', '\r').replace('\\"', '"').replace('\\\\', '\\'))
 
+    # Bare positional call: run_command('ls'), read_file("/x")
+    pos = re.fullmatch(r'\s*(["\'])(.*)\1\s*', args_str, re.DOTALL)
+    if pos:
+        params = list(inspect.signature(TOOL_REGISTRY[tool_name]).parameters)
+        return {params[0]: _unescape(pos.group(2))}
+
+    def _short(key: str):
+        """Value of `key` up to its matching close quote. Any quote style."""
+        m = re.search(_KEY(key) + r'(["\']{1,3})(.*?)\1', args_str, re.DOTALL)
+        return _unescape(m.group(2)) if m else None
+
+    def _rest(key: str):
+        """Value of `key` running to end of args — for free-form bodies that
+        may contain unbalanced quotes. Trailing quote/brace/paren stripped."""
+        m = re.search(_KEY(key) + r'["\']{1,3}(.*)', args_str, re.DOTALL)
+        if not m:
+            return None
+        return _unescape(re.sub(r'["\']{1,3}\s*[}\)]*\s*$', '', m.group(1)))
+
     if tool_name in ("write_file", "read_file", "search_file"):
-        fn = re.search(r'"filename"\s*:\s*"([^"]+)"', args_str)
+        fn = _short("filename")
         if not fn:
             return {}
-        result: Dict[str, Any] = {"filename": fn.group(1)}
+        result: Dict[str, Any] = {"filename": fn}
         if tool_name == "write_file":
-            ct = re.search(r'"content"\s*:\s*"(.*)"', args_str, re.DOTALL)
+            ct = _rest("content")
             if ct:
-                result["content"] = _unescape(ct.group(1))
+                result["content"] = ct
         elif tool_name == "search_file":
-            tx = re.search(r'"text"\s*:\s*"([^"]*)"', args_str)
+            tx = _short("text")
             if tx:
-                result["text"] = tx.group(1)
+                result["text"] = tx
         return result
 
     if tool_name in ("list_files",):
-        p = re.search(r'"path"\s*:\s*"([^"]+)"', args_str)
-        return {"path": p.group(1)} if p else {}
+        p = _short("path")
+        return {"path": p} if p else {}
 
     if tool_name == "edit_file":
-        p  = re.search(r'"path"\s*:\s*"([^"]+)"', args_str)
-        os = re.search(r'"old_str"\s*:\s*"(.*?)"(?=\s*,\s*"new_str")', args_str, re.DOTALL)
-        ns = re.search(r'"new_str"\s*:\s*"(.*)"', args_str, re.DOTALL)
-        if p and ns:
-            return {
-                "path": p.group(1),
-                "old_str": _unescape(os.group(1)) if os else "",
-                "new_str": _unescape(ns.group(1)),
-            }
+        p, ns = _short("path"), _rest("new_str")
+        if p and ns is not None:
+            return {"path": p, "old_str": _short("old_str") or "", "new_str": ns}
 
     return {}
 
 
+# Matches "tool: write_file(" (documented form) or a bare "write_file(" —
+# models routinely drop the prefix, which silently turned calls into chat text.
+_TOOL_CALL_RE = re.compile(
+    r'tool\d*:\s*(\w+)\s*\(|\b(' + '|'.join(TOOL_REGISTRY) + r')\s*\('
+)
+
+
 def extract_tools(text: str) -> List[Tuple[str, Dict[str, Any]]]:
     out = []
-    for m in re.finditer(r'tool\d*:\s*(\w+)\s*\(', text):
-        name = m.group(1).strip()
+    for m in _TOOL_CALL_RE.finditer(text):
+        name = (m.group(1) or m.group(2)).strip()
         # String-aware balanced-paren scan — skips ( ) inside string literals
         depth, i = 1, m.end()
         while i < len(text) and depth > 0:
@@ -444,15 +448,18 @@ def extract_tools(text: str) -> List[Tuple[str, Dict[str, Any]]]:
                 i += 2
                 continue
             if c in ('"', "'"):
-                q = c
-                i += 1
+                # Triple quotes first — models emit '''...''' for file bodies
+                q = text[i:i + 3] if text[i:i + 3] in ('"""', "'''") else c
+                i += len(q)
                 while i < len(text):
                     if text[i] == '\\':
                         i += 2
                         continue
-                    if text[i] == q:
+                    if text.startswith(q, i):
+                        i += len(q)
                         break
                     i += 1
+                continue
             elif c == '(':
                 depth += 1
             elif c == ')':
@@ -462,15 +469,27 @@ def extract_tools(text: str) -> List[Tuple[str, Dict[str, Any]]]:
         # 1. Raw JSON
         try:
             args = json.loads(args_str)
+            if not isinstance(args, dict):
+                raise ValueError("not an object")  # fall through to positional
         except Exception:
             # 2. JSON after fixing bare newlines/tabs in string values
             try:
                 args = json.loads(_fix_json_newlines(args_str))
+                if not isinstance(args, dict):
+                    raise ValueError("not an object")
             except Exception:
-                # 3. Greedy targeted extraction (handles embedded quotes in content)
+                # 3. Python literal — single quotes, triple quotes, True/None
+                try:
+                    args = ast.literal_eval(args_str.strip())
+                    if not isinstance(args, dict):
+                        raise ValueError("not an object")
+                except Exception:
+                    args = None
+            if args is None:
+                # 4. Greedy targeted extraction (handles embedded quotes in content)
                 args = _try_targeted_extract(name, args_str)
                 if not args:
-                    # 4. Keyword-argument fallback (last resort)
+                    # 5. Keyword-argument fallback (last resort)
                     args = _parse_kwargs_syntax(args_str)
                     if not args:
                         continue

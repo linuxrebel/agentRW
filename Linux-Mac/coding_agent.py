@@ -1,26 +1,10 @@
 #!/usr/bin/env python3
-# Requires Python 3.7+  (3.8+ recommended)
+# Requires Python 3.10+ (uses `int | None` annotations)
 
 import sys
 
-if sys.version_info < (3, 7):
-    _v = sys.version.split()[0]
-    print(f"""
-coding_agent.py requires Python 3.7 or newer.
-
-  Your Python : {_v}
-  Required    : 3.7+ (3.8+ recommended)
-
-How to resolve:
-  • Install a newer Python via your package manager:
-      Fedora/RHEL : sudo dnf install python3
-      Debian/Ubuntu: sudo apt install python3
-  • Use pyenv to manage multiple Python versions: https://github.com/pyenv/pyenv
-  • Use a conda/mamba environment with a newer Python
-
-Your system Python at {sys.executable} will not be changed — only this script needs a newer interpreter.
-""")
-    sys.exit(1)
+if sys.version_info < (3, 10):
+    sys.exit(f"coding_agent.py needs Python 3.10+, found {sys.version.split()[0]}")
 
 import ast
 import inspect
@@ -59,7 +43,6 @@ RULES
 9. [CURRENT DIR: /path] in each message = working directory. Copy it verbatim.
 10. On tool_result error: fix args and retry. Do not give up after one error.
 11. Do only what was asked, then stop.
-12. If write_file fails repeatedly, output the complete corrected code as a fenced code block (```python\\n...\\n```) — it will be saved to the requested path automatically.
 """
 
 # Binaries that exist on most systems but are common English words —
@@ -72,23 +55,21 @@ def _init_ansi() -> bool:
     if sys.platform != "win32":
         return True
     try:
-        import colorama
+        import colorama  # declared in Windows/requirements.txt
         colorama.init()
         return True
     except ImportError:
-        pass
-    try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-        return True
-    except Exception:
         return False
 
 _ANSI = _init_ansi()
 YOU_COLOR       = "\033[94m" if _ANSI else ""
 ASSISTANT_COLOR = "\033[93m" if _ANSI else ""
 RESET_COLOR     = "\033[0m"  if _ANSI else ""
+
+SLASH_COMMANDS = (
+    "/help", "/model", "/gpu-layers", "/low-vram", "/compact", "/tokens",
+    "/reset", "/pwd", "/ops", "/olist", "/update", "/bye", "cd <path>",
+)
 
 _CHARS_PER_TOKEN = 4
 TOKEN_BUDGET = 8000  # max non-system tokens before proactive trim
@@ -308,67 +289,18 @@ def build_prompt() -> str:
 # -----------------------------
 # Tool parsing
 # -----------------------------
-def _parse_kwargs_syntax(args_str: str) -> Dict[str, Any]:
-    """Parse Python keyword-argument style: key="value", key=123, key='value'"""
-    result = {}
-    pattern = re.compile(
-        r'(\w+)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|\'((?:[^\'\\]|\\.)*)\''
-        r'|(\w+)\s*=\s*([\w.+-]+))'
-    )
-    for m in pattern.finditer(args_str):
-        key = m.group(1) or m.group(4)
-        if m.group(2) is not None:
-            try:
-                val = m.group(2).encode("raw_unicode_escape").decode("unicode_escape")
-            except (UnicodeDecodeError, ValueError):
-                val = m.group(2)
-        elif m.group(3) is not None:
-            try:
-                val = m.group(3).encode("raw_unicode_escape").decode("unicode_escape")
-            except (UnicodeDecodeError, ValueError):
-                val = m.group(3)
-        else:
-            raw = m.group(5)
-            try:
-                val = json.loads(raw)
-            except Exception:
-                val = raw
-        result[key] = val
-    return result
-
-
-def _fix_json_newlines(s: str) -> str:
-    """Escape bare newlines/tabs inside JSON string literals."""
-    result = []
-    in_str = False
-    i = 0
-    while i < len(s):
-        c = s[i]
-        if in_str:
-            if c == '\\':
-                result.append(c)
-                i += 1
-                if i < len(s):
-                    result.append(s[i])
-                i += 1
-                continue
-            if c == '"':
-                in_str = False
-                result.append(c)
-            elif c == '\n':
-                result.append('\\n')
-            elif c == '\r':
-                result.append('\\r')
-            elif c == '\t':
-                result.append('\\t')
-            else:
-                result.append(c)
-        else:
-            if c == '"':
-                in_str = True
-            result.append(c)
-        i += 1
-    return ''.join(result)
+def _parse_python_call(tool_name: str, args_str: str) -> Dict[str, Any]:
+    """Parse args as Python source: dict literal, kwargs, or positional —
+    any quote style. Raises if args_str is not a well-formed expression."""
+    call = ast.parse(f"_f({args_str})", mode="eval").body
+    kwargs = {k.arg: ast.literal_eval(k.value) for k in call.keywords if k.arg}
+    pos = [ast.literal_eval(a) for a in call.args]
+    if len(pos) == 1 and isinstance(pos[0], dict) and not kwargs:
+        return pos[0]  # the common form: write_file({...})
+    if pos and tool_name in TOOL_REGISTRY:
+        params = list(inspect.signature(TOOL_REGISTRY[tool_name]).parameters)
+        kwargs.update(zip(params, pos))
+    return kwargs
 
 
 def _KEY(name: str) -> str:
@@ -382,12 +314,6 @@ def _try_targeted_extract(tool_name: str, args_str: str) -> Dict[str, Any]:
     def _unescape(s: str) -> str:
         return (s.replace('\\n', '\n').replace('\\t', '\t')
                  .replace('\\r', '\r').replace('\\"', '"').replace('\\\\', '\\'))
-
-    # Bare positional call: run_command('ls'), read_file("/x")
-    pos = re.fullmatch(r'\s*(["\'])(.*)\1\s*', args_str, re.DOTALL)
-    if pos:
-        params = list(inspect.signature(TOOL_REGISTRY[tool_name]).parameters)
-        return {params[0]: _unescape(pos.group(2))}
 
     def _short(key: str):
         """Value of `key` up to its matching close quote. Any quote style."""
@@ -466,35 +392,23 @@ def extract_tools(text: str) -> List[Tuple[str, Dict[str, Any]]]:
                 depth -= 1
             i += 1
         args_str = text[m.end():i - 1]
-        # 1. Raw JSON
+        # 1. JSON. strict=False tolerates bare newlines/tabs inside strings.
         try:
-            args = json.loads(args_str)
+            args = json.loads(args_str, strict=False)
             if not isinstance(args, dict):
-                raise ValueError("not an object")  # fall through to positional
+                raise ValueError("not an object")
         except Exception:
-            # 2. JSON after fixing bare newlines/tabs in string values
+            # 2. Python source: dict literal, kwargs, or positional args.
             try:
-                args = json.loads(_fix_json_newlines(args_str))
-                if not isinstance(args, dict):
-                    raise ValueError("not an object")
+                args = _parse_python_call(name, args_str)
+                if not args:
+                    raise ValueError("no args")
             except Exception:
-                # 3. Python literal — single quotes, triple quotes, True/None
-                try:
-                    args = ast.literal_eval(args_str.strip())
-                    if not isinstance(args, dict):
-                        raise ValueError("not an object")
-                except Exception:
-                    args = None
-            if args is None:
-                # 4. Greedy targeted extraction (handles embedded quotes in content)
+                # 3. Regex salvage — the only thing that survives genuinely
+                #    malformed output (unbalanced quotes, truncated bodies).
                 args = _try_targeted_extract(name, args_str)
                 if not args:
-                    # 5. Keyword-argument fallback (last resort)
-                    args = _parse_kwargs_syntax(args_str)
-                    if not args:
-                        continue
-        if not isinstance(args, dict):
-            continue
+                    continue
         out.append((name, args))
     return out
 
@@ -548,8 +462,8 @@ def proactive_trim(messages: list, budget_tokens: int = TOKEN_BUDGET) -> int:
 def call_llm(model: str, messages: list, gpu_layers: "list[int | None]" = None,
              max_tokens: int = 2000, num_ctx: int | None = None,
              token_budget: int = TOKEN_BUDGET) -> str:
-    compact_tool_results(messages)
-    trimmed = proactive_trim(messages, budget_tokens=token_budget)
+    budget = token_budget
+    trimmed = proactive_trim(messages, budget_tokens=budget)
     if trimmed:
         print(f"\n[Context] Proactively dropped {trimmed} old message(s). "
               f"~{estimate_tokens(messages):,} tokens remaining.")
@@ -577,11 +491,11 @@ def call_llm(model: str, messages: list, gpu_layers: "list[int | None]" = None,
             return r.choices[0].message.content or ""
         except BadRequestError as e:
             if "exceed_context_size" in str(e) or getattr(e, "status_code", None) == 400:
-                non_sys = [i for i, m in enumerate(working) if m["role"] != "system"]
-                if len(non_sys) <= 2:
+                # Halve the budget and reuse the one trimmer until it can't cut more.
+                budget = max(budget // 2, 200)
+                if not proactive_trim(working, budget_tokens=budget):
                     print(f"\n{ASSISTANT_COLOR}[Error]{RESET_COLOR} Context full and nothing left to trim.")
                     return ""
-                del working[non_sys[0]:non_sys[1]+1]
             else:
                 print(f"\n{ASSISTANT_COLOR}[Error]{RESET_COLOR} Bad request: {e}")
                 return ""
@@ -785,12 +699,7 @@ def run(model: str, gpu_layers: int | None = None,
             continue
 
         if user.lower() in {"/help", "-h", "--help"}:
-            print(
-                "/help       /model      /gpu-layers  /low-vram\n"
-                "/compact    /tokens     /reset       /pwd\n"
-                "/ops        /olist      /update      /bye\n"
-                "cd <path>"
-            )
+            print("  ".join(SLASH_COMMANDS))
             continue
 
         if user.lower() == "/ops":
@@ -919,17 +828,6 @@ def run(model: str, gpu_layers: int | None = None,
                 print(f"{ASSISTANT_COLOR}Assistant:{RESET_COLOR} {reply}")
                 messages.append({"role": "assistant", "content": reply})
                 consecutive_errors = 0
-
-                # Auto-save fenced code blocks to paths mentioned in user message
-                blocks = re.findall(r'```(?:\w+)?\n(.*?)```', reply, re.DOTALL)
-                if blocks and detected:
-                    for path_str in detected:
-                        p = resolve_abs_path(path_str)
-                        if p.suffix:  # has extension → it's a file target
-                            result = write_file_tool(str(p), blocks[0].rstrip('\n'))
-                            print(f"[auto-saved] {_summarise_result('write_file', result)}")
-                            break
-
                 break
 
             # Hard cap: prevent runaway tool-call loops
@@ -1017,12 +915,10 @@ OPTIONS
   -h, --help         Show this help
 
 SLASH COMMANDS
-  /help  /model  /gpu-layers  /low-vram  /compact  /tokens
-  /reset  /pwd  /ops  /olist  /update  /bye  cd <path>
+  {"  ".join(SLASH_COMMANDS)}
 
 MODEL TOOLS  (invoked automatically by the model)
-  read_file    write_file    edit_file
-  search_file  list_files    run_command
+  {"  ".join(TOOL_REGISTRY)}
 
 EXAMPLES
   coding_agent qwen2.5-coder:7b-instruct-q4_K_M --low-vram
@@ -1064,15 +960,11 @@ def _resolve_model(passed: str | None, cli_flags: dict) -> tuple:
     saved = cfg.get("default")  # {"model": "...", "low_vram": ..., ...}
 
     if passed is None:
-        if saved and isinstance(saved, dict) and "model" in saved:
-            model = saved["model"]
+        if saved and "model" in saved:
             saved_flags = {k: v for k, v in saved.items() if k != "model"}
             effective = {**saved_flags, **{k: v for k, v in cli_flags.items() if v not in (None, False, 2000)}}
-            return model, effective
-        if saved and isinstance(saved, str):
-            print("Config format updated. Please re-run with a model name to set a new default.")
-        else:
-            print("First run: please provide a model name and any arguments. Run --help for options.")
+            return saved["model"], effective
+        print("First run: please provide a model name and any arguments. Run --help for options.")
         sys.exit(0)
 
     new_default = {"model": passed, **cli_flags}
@@ -1082,9 +974,8 @@ def _resolve_model(passed: str | None, cli_flags: dict) -> tuple:
         print(f"[Config] Default set to: {passed}")
         return passed, cli_flags
 
-    saved_model = saved.get("model", "?") if isinstance(saved, dict) else str(saved)
-    saved_flags = {k: v for k, v in saved.items() if k != "model"} if isinstance(saved, dict) else {}
-    saved_display = f"{saved_model} {_flags_to_str(saved_flags)}".strip()
+    saved_flags = {k: v for k, v in saved.items() if k != "model"}
+    saved_display = f"{saved.get('model', '?')} {_flags_to_str(saved_flags)}".strip()
     this_display = f"{passed} {_flags_to_str(cli_flags)}".strip()
 
     if new_default != saved and cfg.get("ask_new_default", True):
@@ -1111,18 +1002,12 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("model", nargs="?", default=None)
-    parser.add_argument("--gpu-layers", type=int, default=None,
-                        help="Max GPU layers (0=CPU only). Unset = Ollama default.")
-    parser.add_argument("--num-ctx", type=int, default=None,
-                        help="Context window size. Lower = less VRAM.")
-    parser.add_argument("--max-tokens", type=int, default=2000,
-                        help="Max output tokens per reply (default 2000).")
-    parser.add_argument("--low-vram", action="store_true",
-                        help=f"4GB VRAM preset: num_ctx={LOW_VRAM_PRESET['num_ctx']}, "
-                             f"max_tokens={LOW_VRAM_PRESET['max_tokens']}, "
-                             f"token_budget={LOW_VRAM_PRESET['token_budget']}")
-    parser.add_argument("--set-default", metavar="MODEL",
-                        help="Set a new default model in config and exit.")
+    # No help= text: add_help=False, print_help() below is the only help output.
+    parser.add_argument("--gpu-layers", type=int, default=None)
+    parser.add_argument("--num-ctx", type=int, default=None)
+    parser.add_argument("--max-tokens", type=int, default=2000)
+    parser.add_argument("--low-vram", action="store_true")
+    parser.add_argument("--set-default", metavar="MODEL")
     parser.add_argument("-h", "--help", action="store_true")
     args = parser.parse_args()
 

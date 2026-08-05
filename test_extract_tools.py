@@ -247,8 +247,71 @@ def test_output_is_capped():
         ca._word_is_command.clear()
 
 
+def test_native_tool_calls_are_read():
+    """Native tool_calls must not be lost.
+
+    gemma4:31b-cloud answers with finish_reason="tool_calls" and content "".
+    Reading only .content dropped the whole reply and the turn ended silently.
+    """
+    import types
+    import coding_agent as ca
+
+    def call(name, args):
+        return types.SimpleNamespace(
+            function=types.SimpleNamespace(name=name, arguments=args))
+
+    msg = types.SimpleNamespace(content="", tool_calls=[
+        call("list_files", '{"path":"/home/james/bin"}')])
+    assert ca.extract_tools(ca._reply_text(msg)) == [
+        ("list_files", {"path": "/home/james/bin"})]
+
+    multi = types.SimpleNamespace(content=None, tool_calls=[
+        call("read_file", '{"filename":"a.py"}'),
+        call("lint_file", '{"filename":"a.py"}')])
+    assert len(ca.extract_tools(ca._reply_text(multi))) == 2
+
+    # plain text replies unaffected
+    assert ca._reply_text(types.SimpleNamespace(content="hi", tool_calls=None)) == "hi"
+    assert ca._reply_text(types.SimpleNamespace(content=None, tool_calls=None)) == ""
+
+    # schema is derived from the registry, so plugins are included
+    names = {t["function"]["name"] for t in ca.TOOLS_SCHEMA}
+    assert names == set(ca.TOOL_REGISTRY), names
+    rf = next(t for t in ca.TOOLS_SCHEMA if t["function"]["name"] == "read_file")
+    params = rf["function"]["parameters"]
+    assert params["required"] == ["filename"], params
+    assert params["properties"]["start_line"]["type"] == "integer", params
+
+
+def test_json_tool_call_format():
+    """Sending a tools schema makes some models answer with the JSON call
+    object as plain text. qwen2.5-coder does this on ~2 turns in 3, and it
+    was being dropped entirely."""
+    import coding_agent as ca
+    cases = [
+        ('{"name": "read_file", "arguments": {"filename": "/x/y.py"}}',
+         [("read_file", {"filename": "/x/y.py"})]),
+        ('{"name":"run_command","arguments":{"cmd":"ls -la"}}',
+         [("run_command", {"cmd": "ls -la"})]),
+        ('I will do this:\n{"name": "lint_file", "arguments": {"filename": "a.py"}}\nok',
+         [("lint_file", {"filename": "a.py"})]),
+        ('{"name":"read_file","arguments":"{\\"filename\\":\\"a.py\\"}"}',
+         [("read_file", {"filename": "a.py"})]),
+        ('```json\n{"name":"read_file","arguments":{"filename":"a.py"}}\n```',
+         [("read_file", {"filename": "a.py"})]),
+        ('{"name":"not_a_tool","arguments":{}}', []),
+        ('just prose, no calls at all', []),
+        # the paren form must still win, unchanged
+        ('read_file({"filename":"/x/y.py"})', [("read_file", {"filename": "/x/y.py"})]),
+    ]
+    for text, want in cases:
+        assert ca.extract_tools(text) == want, (text, ca.extract_tools(text))
+
+
 if __name__ == "__main__":
     test_extract_tools()
+    test_native_tool_calls_are_read()
+    test_json_tool_call_format()
     test_output_is_capped()
     test_fix_loop_pieces()
     test_ui_arg_mapping()

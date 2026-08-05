@@ -543,6 +543,44 @@ _TOOL_CALL_RE = re.compile(
 )
 
 
+def _extract_json_tool_calls(text: str) -> List[Tuple[str, Dict[str, Any]]]:
+    """Parse {"name": ..., "arguments": {...}} objects emitted as plain text.
+
+    Once a tools schema is sent, models that lack native tool_calls often
+    answer with the JSON call object as content instead. qwen2.5-coder does
+    this on roughly two turns in three. It is a tool call in every sense
+    except the syntax the paren-scanner looks for.
+    """
+    blobs = []
+    stripped = re.sub(r'^```(?:json)?\s*|\s*```$', '', text.strip())
+    try:
+        whole = json.loads(stripped)          # the whole reply is the call
+        blobs = whole if isinstance(whole, list) else [whole]
+    except Exception:
+        blobs = []
+        for m in re.finditer(r'\{[^{}]*"name"\s*:\s*"\w+".*?\}\s*\}|'
+                             r'\{[^{}]*"name"\s*:\s*"\w+"[^{}]*\}', text, re.DOTALL):
+            try:
+                blobs.append(json.loads(m.group(0)))
+            except Exception:
+                continue
+
+    out = []
+    for obj in blobs:
+        if not isinstance(obj, dict):
+            continue
+        name = obj.get("name")
+        args = obj.get("arguments", obj.get("parameters", {}))
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                continue
+        if name in TOOL_REGISTRY and isinstance(args, dict):
+            out.append((name, args))
+    return out
+
+
 def extract_tools(text: str) -> List[Tuple[str, Dict[str, Any]]]:
     out = []
     for m in _TOOL_CALL_RE.finditer(text):
@@ -591,7 +629,7 @@ def extract_tools(text: str) -> List[Tuple[str, Dict[str, Any]]]:
                 if not args:
                     continue
         out.append((name, args))
-    return out
+    return out or _extract_json_tool_calls(text)
 
 
 # -----------------------------
@@ -640,9 +678,51 @@ def proactive_trim(messages: list, budget_tokens: int = TOKEN_BUDGET) -> int:
 # -----------------------------
 # LLM call
 # -----------------------------
+def _tools_schema() -> List[Dict[str, Any]]:
+    """OpenAI tool schema, derived from the same registry the prompt uses.
+
+    Models with native tool calling need this to answer at all: without it
+    gemma4:31b-cloud returned empty content on 2 of 3 attempts, because it
+    wanted to emit a tool call and had no schema to emit against. With it,
+    3 of 3. Costs nothing for models that ignore it.
+    """
+    out = []
+    for name, fn in TOOL_REGISTRY.items():
+        props, required = {}, []
+        for p, prm in inspect.signature(fn).parameters.items():
+            props[p] = {"type": "integer" if prm.annotation is int else "string",
+                        "description": p}
+            if prm.default is inspect.Parameter.empty:
+                required.append(p)
+        out.append({"type": "function", "function": {
+            "name": name,
+            "description": (fn.__doc__ or "").strip().split("\n")[0],
+            "parameters": {"type": "object", "properties": props,
+                           "required": required}}})
+    return out
+
+
+TOOLS_SCHEMA = _tools_schema()
+
+
+def _reply_text(msg) -> str:
+    """Normalise a reply into the text form extract_tools understands.
+
+    Capable models answer with NATIVE tool_calls and leave content empty —
+    gemma4:31b-cloud returns finish_reason="tool_calls" with 23 completion
+    tokens and content "". Reading only .content loses the entire response and
+    the turn ends silently. Rewriting them as `name({...})` means the existing
+    parser, arg validation, confirmation and summarising all work unchanged.
+    """
+    calls = getattr(msg, "tool_calls", None)
+    if calls:
+        return "\n".join(f"{c.function.name}({c.function.arguments})" for c in calls)
+    return msg.content or ""
+
+
 def call_llm(model: str, messages: list, gpu_layers: "list[int | None]" = None,
              max_tokens: int = 2000, num_ctx: int | None = None,
-             token_budget: int = TOKEN_BUDGET) -> str:
+             token_budget: int = TOKEN_BUDGET, send_tools: bool = True) -> str:
     budget = token_budget
     trimmed = proactive_trim(messages, budget_tokens=budget)
     if trimmed:
@@ -659,18 +739,28 @@ def call_llm(model: str, messages: list, gpu_layers: "list[int | None]" = None,
                 options["num_gpu"] = layers
             if num_ctx is not None:
                 options["num_ctx"] = num_ctx
+            kw: Dict[str, Any] = {}
+            if send_tools:
+                kw["tools"] = TOOLS_SCHEMA
             r = client.chat.completions.create(
                 model=model,
                 messages=working,
                 max_tokens=max_tokens,
                 extra_body={"options": options} if options else None,
+                **kw,
             )
             if len(working) < len(messages):
                 trimmed = len(messages) - len(working)
                 print(f"\n[Context] Trimmed {trimmed} old message(s) to fit context window.")
                 messages[:] = working
-            return r.choices[0].message.content or ""
+            return _reply_text(r.choices[0].message)
         except BadRequestError as e:
+            # Some models reject a tools schema outright. Drop it and retry
+            # rather than failing the turn.
+            if send_tools and "tool" in str(e).lower():
+                print(f"\n[Tools] {model} rejected the tool schema — retrying without.")
+                send_tools = False
+                continue
             if "exceed_context_size" in str(e) or getattr(e, "status_code", None) == 400:
                 # Halve the budget and reuse the one trimmer until it can't cut more.
                 budget = max(budget // 2, 200)
@@ -857,7 +947,8 @@ def _propose_fix(model: str, cfg: dict, layers_ref: list,
             f"Rewrite ONLY line {n}:\n{target}")},
     ]
     return (call_llm(model, msgs, gpu_layers=layers_ref, max_tokens=300,
-                     num_ctx=cfg["num_ctx"], token_budget=cfg["token_budget"]) or "").strip()
+                     num_ctx=cfg["num_ctx"], token_budget=cfg["token_budget"],
+                     send_tools=False) or "").strip()
 
 
 def _defer(path: str, finding: Dict[str, Any], note: str = "") -> None:
@@ -1115,9 +1206,13 @@ def run(model: str, gpu_layers: int | None = None,
                     print(f"[CWD] Current dir is: {_agent_cwd[0]}  (use ~/... for home-relative paths)")
                     continue
             print(f"[CWD] {_agent_cwd[0]}")
-            if len(parts) > 2:
-                print(f"[CWD] Note: only the path was used. Send the rest as a separate message.")
-            continue
+            # "cd /path and then read foo.py" — the rest is a real instruction,
+            # not noise. Fall through and handle it instead of discarding it.
+            _rest = re.sub(r'^(?:and\s+)?(?:then\s+)?', '',
+                           user.split(None, 2)[2] if len(parts) > 2 else '').strip()
+            if not _rest:
+                continue
+            user = _rest
 
         # /fix <file> [symbol] [max=N] — the loop that actually changes code.
         # One finding at a time: context per iteration is constant, so a file
@@ -1274,6 +1369,10 @@ def run(model: str, gpu_layers: int | None = None,
                 break
 
             if not reply:
+                # Never end a turn silently — "Thinking..." then nothing back at
+                # the prompt looks like a crash and hides the real cause.
+                print(f"{ASSISTANT_COLOR}[Empty reply]{RESET_COLOR} the model returned "
+                      f"nothing. Try rephrasing, /reset, or a different model.")
                 messages.pop()
                 break
 

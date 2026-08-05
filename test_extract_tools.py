@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Guards tool-call parsing: bare calls and positional args must not be
 treated as chat text (that bug silently swallowed every write_file)."""
+import inspect
 import io
 import os
 import pathlib
@@ -78,8 +79,181 @@ def test_command_confirmation_defaults_to_no():
         ca._auto_approve[0] = False
 
 
+def test_lint_file_summarises():
+    """lint_file must aggregate. A dump would defeat the point of the tool."""
+    import json
+    import shutil as _sh
+    import coding_agent as ca
+    if not _sh.which("pylint") or "lint_file" not in ca.TOOL_REGISTRY:
+        return  # optional dependency / plugin not installed
+    lint = ca.TOOL_REGISTRY["lint_file"]
+    work = tempfile.mkdtemp()
+    src = os.path.join(work, "sample.py")
+    with open(src, "w") as f:
+        f.write("import os\nimport sys\n" + "".join(
+            f"def f{i}(): return {i}\n" for i in range(40)))
+
+    r = lint(src)
+    assert "score" in r and r["total"] > 0, r
+    assert len(r["top_issues"]) <= 6, r["top_issues"]
+    # The whole point: the result stays small no matter how many messages.
+    assert len(json.dumps(r)) < 1200, len(json.dumps(r))
+
+    sym = r["top_issues"][0]["symbol"]
+    d = lint(src, symbol=sym)
+    assert d["symbol"] == sym and d["count"] >= 1, d
+    assert len(d["occurrences"]) <= 20
+
+    assert lint(os.path.join(work, "gone.py"))["error"] == "file_not_found"
+
+
+def test_plugin_loading():
+    """Dropping a .py into tools/ installs a tool; removing it uninstalls."""
+    import coding_agent as ca
+    d = pathlib.Path(tempfile.mkdtemp())
+
+    assert ca.load_plugin_tools(d) == {}                    # empty dir
+    assert ca.load_plugin_tools(d / "nope") == {}           # missing dir
+
+    (d / "demo.py").write_text(
+        "def demo_tool(x: str) -> dict:\n"
+        '    """Demo."""\n'
+        "    return {'x': x}\n")
+    (d / "_skipme.py").write_text("def hidden_tool(): return {}\n")
+    (d / "broken.py").write_text("def oops_tool(\n")        # syntax error
+
+    found = ca.load_plugin_tools(d)
+    assert "demo" in found, found                            # discovered
+    assert "hidden" not in found, found                      # _prefix skipped
+    assert "oops" not in found, found                        # broken isolated
+    assert found["demo"](x="hi") == {"x": "hi"}              # and it runs
+
+    # A discovered tool must be indistinguishable from a core one to the prompt.
+    fn = found["demo"]
+    assert fn.__doc__ and str(inspect.signature(fn))
+
+    (d / "demo.py").unlink()
+    assert "demo" not in ca.load_plugin_tools(d)             # uninstalled
+
+
+def test_ui_arg_mapping():
+    """/tool <args> maps bare tokens positionally, k=v by name, ints coerced."""
+    import coding_agent as ca
+
+    def parse(cmd):
+        parts = cmd.lstrip("/").split()
+        sig = inspect.signature(ca.TOOL_REGISTRY[parts[0]])
+        params = list(sig.parameters)
+
+        def coerce(p, raw):
+            ann = sig.parameters[p].annotation
+            return int(raw) if ann is int else raw
+
+        args, pos = {}, 0
+        for tok in parts[1:]:
+            k = tok.split("=", 1)[0]
+            if "=" in tok and k in params:
+                args[k] = coerce(k, tok.split("=", 1)[1])
+            elif pos < len(params):
+                args[params[pos]] = coerce(params[pos], tok)
+                pos += 1
+        return args
+
+    assert parse("/read_file a.py") == {"filename": "a.py"}
+    # ints must be coerced or the tool raises TypeError
+    assert parse("/read_file a.py start_line=5") == {"filename": "a.py", "start_line": 5}
+    assert parse("/search_file a.py needle") == {"filename": "a.py", "text": "needle"}
+
+
+def test_fix_loop_pieces():
+    """/fix must gather every finding in ONE detector run, apply, and defer."""
+    import shutil as _sh
+    import coding_agent as ca
+    if not _sh.which("pylint") or "lint_file" not in ca.TOOL_REGISTRY:
+        return
+
+    work = pathlib.Path(tempfile.mkdtemp())
+    ca._agent_cwd[0] = work
+    ca._extra_write_dirs.clear()
+    src = work / "sample.py"
+    src.write_text("import os\nimport sys\nx=1\n")
+
+    calls = []
+    real = ca.TOOL_REGISTRY["lint_file"]
+    ca.TOOL_REGISTRY["lint_file"] = lambda **kw: (calls.append(kw), real(**kw))[1]
+    try:
+        found = ca._gather_findings(str(src))
+    finally:
+        ca.TOOL_REGISTRY["lint_file"] = real
+
+    # The whole point of symbol="*": one run, not one per kind.
+    assert len(calls) == 1, calls
+    assert len(found) >= 3, found
+    assert all({"line", "symbol", "message"} <= set(f) for f in found), found
+    assert found == sorted(found, key=lambda f: f["line"])
+
+    # apply
+    assert ca.edit_file_tool(str(src), "x=1", "x = 1")["action"] == "edited"
+    assert "x = 1" in src.read_text()
+
+    # defer writes a ledger line instead of losing the finding
+    ca._defer("sample.py", found[0])
+    assert (work / ca.DEBT_FILE).read_text().startswith("- [ ] sample.py:")
+
+
+def test_output_is_capped():
+    """Unbounded output must kill the command, not fill RAM.
+
+    `yes read dr-strange.py ...` went through the passthrough, and
+    capture_output=True buffered it to 29 GB before the OOM killer took the
+    whole agent down. Truncating after the fact is too late.
+    """
+    import resource
+    import coding_agent as ca
+
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+
+    for cmd in ("yes read dr-strange.py and tell me if you see any code errors",
+                "yes",
+                "cat /dev/urandom"):          # binary: must not crash the reader
+        out, _err, _rc, capped = ca._run_capped(cmd, timeout=30)
+        assert capped is True, cmd
+        assert len(out) <= ca.MAX_CAPTURE_BYTES + 65536, (cmd, len(out))
+
+    after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+    assert after - before < 500, f"RSS grew {after - before} MB"
+
+    # ordinary commands unaffected
+    out, _e, rc, capped = ca._run_capped("echo hello", timeout=10)
+    assert out.strip() == "hello" and rc == 0 and capped is False
+    assert ca._run_capped("exit 3", timeout=10)[2] == 3
+
+    # `yes` must not reach the passthrough silently — it is prompted for, and
+    # the default answer treats the line as a message.
+    assert "yes" in ca._AMBIGUOUS_WORDS
+    real_stdin = sys.stdin
+    try:
+        ca._word_is_command.clear()
+        sys.stdin = io.StringIO("\n")          # bare Enter = default
+        assert ca._resolve_ambiguous("yes", "yes, do that") is False
+        sys.stdin = io.StringIO("")            # EOF must also decline
+        ca._word_is_command.clear()
+        assert ca._resolve_ambiguous("yes", "yes, do that") is False
+        ca._word_is_command.clear()
+        sys.stdin = io.StringIO("1\n")
+        assert ca._resolve_ambiguous("sort", "sort file.txt") is True
+    finally:
+        sys.stdin = real_stdin
+        ca._word_is_command.clear()
+
+
 if __name__ == "__main__":
     test_extract_tools()
+    test_output_is_capped()
+    test_fix_loop_pieces()
+    test_ui_arg_mapping()
+    test_lint_file_summarises()
+    test_plugin_loading()
     test_writes_are_scoped()
     test_command_confirmation_defaults_to_no()
     print("ok")

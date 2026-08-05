@@ -8,12 +8,14 @@ if sys.version_info < (3, 10):
 
 import ast
 import concurrent.futures
+import importlib.util
 import inspect
 import json
 import os
 import re
 import shutil
 import subprocess
+import threading
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -50,9 +52,50 @@ RULES
 11. Do only what was asked, then stop.
 """
 
-# Binaries that exist on most systems but are common English words —
-# they misbehave (hang/block/no-op) when given natural language as arguments.
-_PASSTHROUGH_SKIP = {"read", "write", "wait", "test", "true", "false"}
+# Binaries that are also ordinary English words. "yes, do that" is a sentence;
+# /usr/bin/yes is a command that prints forever. A fixed skip list can never be
+# complete — sort, head, find and friends are all real words — so these prompt
+# instead, defaulting to treating the line as a message.
+_AMBIGUOUS_WORDS = {
+    "yes", "no", "read", "write", "wait", "test", "true", "false", "look",
+    "last", "who", "free", "file", "find", "make", "help", "info", "man",
+    "time", "date", "more", "less", "kill", "install", "touch", "sleep",
+    "split", "fold", "expand", "users", "groups", "id", "strings", "size",
+    "stat", "link", "nice", "tee", "sort", "head", "tail", "cut", "join",
+    "paste", "uniq", "seq", "shuf", "dir", "which", "df", "du", "top",
+}
+
+# Per-session answers, so a given word is only asked about once: word -> bool
+# (True = run it as a command).
+_word_is_command: Dict[str, bool] = {}
+
+
+def _resolve_ambiguous(word: str, line: str) -> bool:
+    """True if this line should run as a shell command.
+
+    Only called when the first word is both a real binary and a plain English
+    word. Defaults to 'message' because that is the harmless mistake: sending
+    a stray `ls` to the model wastes a turn, while running a stray `yes`
+    filled 29 GB and got the agent OOM-killed.
+    """
+    if word in _word_is_command:
+        return _word_is_command[word]
+    print(f"\n{ASSISTANT_COLOR}['{word}' is both a command and a word]{RESET_COLOR}"
+          f"  {shutil.which(word)}")
+    print(f"  1) run it:  {line[:70]}")
+    print(f"  2) send to the model as a message")
+    try:
+        answer = input("  [1] command / [2] message (default) / [a]lways command: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        answer = "2"
+    if answer.startswith("a"):
+        _word_is_command[word] = True
+        return True
+    if answer == "1":
+        return True          # this once; ask again next time
+    _word_is_command[word] = False
+    return False
 
 
 def _init_ansi() -> bool:
@@ -73,7 +116,7 @@ RESET_COLOR     = "\033[0m"  if _ANSI else ""
 
 SLASH_COMMANDS = (
     "/help", "/model", "/gpu-layers", "/low-vram", "/compact", "/tokens",
-    "/reset", "/pwd", "/ops", "/olist", "/cloud-models", "/update", "/bye", "cd <path>",
+    "/reset", "/pwd", "/fix", "/ops", "/olist", "/cloud-models", "/update", "/bye", "cd <path>",
 )
 
 _CHARS_PER_TOKEN = 4
@@ -234,6 +277,67 @@ def edit_file_tool(path: str, old_str: str, new_str: str) -> Dict[str, Any]:
         return {"error": str(e), "path": str(p)}
 
 
+MAX_CAPTURE_BYTES = 1_000_000  # per stream, before the command is killed
+
+
+def _run_capped(cmd: str, timeout: int, cwd: str | None = None,
+                cap: int = MAX_CAPTURE_BYTES) -> Tuple[str, str, int, bool]:
+    """Run a shell command, never buffering more than `cap` bytes per stream.
+
+    subprocess.run(capture_output=True) reads until EOF with no ceiling. A
+    command with unbounded output (`yes`, `cat /dev/urandom`, `find /`) fills
+    RAM faster than the timeout can fire — one `yes` reached 29 GB and the
+    kernel OOM-killed the agent. Truncating after the fact is too late; the
+    process has to die when it crosses the cap.
+
+    Returns (stdout, stderr, returncode, truncated).
+    """
+    # errors="replace": binary output (cat /dev/urandom) would otherwise raise
+    # UnicodeDecodeError inside the reader thread, killing the only thing that
+    # enforces the cap while the command keeps producing.
+    proc = subprocess.Popen(cmd, shell=True, cwd=cwd, text=True,
+                            errors="replace",
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    chunks: Dict[str, List[str]] = {"out": [], "err": []}
+    hit_cap = threading.Event()
+
+    def drain(stream, key):
+        total = 0
+        try:
+            while True:
+                data = stream.read(8192)
+                if not data:
+                    break
+                chunks[key].append(data)
+                total += len(data)
+                if total >= cap:
+                    hit_cap.set()
+                    proc.kill()      # stop it producing, do not just stop reading
+                    break
+        except (ValueError, OSError):
+            pass                     # stream closed under us by the kill
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    threads = [threading.Thread(target=drain, args=(proc.stdout, "out"), daemon=True),
+               threading.Thread(target=drain, args=(proc.stderr, "err"), daemon=True)]
+    for t in threads:
+        t.start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    for t in threads:
+        t.join(timeout=5)
+    return ("".join(chunks["out"]), "".join(chunks["err"]),
+            proc.returncode if proc.returncode is not None else -1,
+            hit_cap.is_set())
+
+
 def run_command_tool(cmd: str, timeout: int = 30) -> Dict[str, Any]:
     """Run a shell command as the current user. Returns stdout, stderr, returncode."""
     # Catches the model reaching for sudo by habit. NOT a security boundary:
@@ -246,18 +350,16 @@ def run_command_tool(cmd: str, timeout: int = 30) -> Dict[str, Any]:
             "hint": "This agent runs as the current user. Re-run the command yourself if you need elevation.",
         }
     try:
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        return {
-            "stdout": result.stdout[:4000],
-            "stderr": result.stderr[:2000],
-            "returncode": result.returncode,
+        out, err, rc, truncated = _run_capped(cmd, timeout)
+        result = {
+            "stdout": out[:4000],
+            "stderr": err[:2000],
+            "returncode": rc,
         }
+        if truncated:
+            result["hint"] = ("Output exceeded the capture limit and the command "
+                              "was killed. Narrow it (head, grep, --quiet).")
+        return result
     except subprocess.TimeoutExpired:
         return {"error": "timeout", "hint": f"Command exceeded {timeout}s. Use a shorter operation or increase timeout."}
     except Exception as e:
@@ -305,7 +407,7 @@ def write_file_tool(filename: str, content: str) -> Dict[str, Any]:
         return {"error": str(e), "path": str(p)}
 
 
-TOOL_REGISTRY = {
+CORE_TOOLS = {
     "read_file": read_file_tool,
     "list_files": list_files_tool,
     "edit_file": edit_file_tool,
@@ -313,6 +415,42 @@ TOOL_REGISTRY = {
     "write_file": write_file_tool,
     "run_command": run_command_tool,
 }
+
+
+def load_plugin_tools(d: Path) -> Dict[str, Any]:
+    """Discover tools in d/*.py. Any callable named *_tool becomes a tool.
+
+    That convention is the entire plugin API — no decorator, no manifest, no
+    registration call. build_prompt() reads inspect.signature() and __doc__,
+    so a discovered tool is indistinguishable from a core one.
+
+    Drop a file in to install, move it out to uninstall. A broken plugin is
+    skipped with a warning rather than taking the harness down with it.
+    """
+    found: Dict[str, Any] = {}
+    if not d.is_dir():
+        return found
+    for f in sorted(d.glob("*.py")):
+        if f.name.startswith("_"):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(f.stem, f)
+            mod = importlib.util.module_from_spec(spec)
+            # Plugins need the agent's cwd, not the process cwd — `cd` only
+            # moves _agent_cwd. Injected, so plugins stay importable standalone.
+            mod.__dict__["resolve_abs_path"] = resolve_abs_path
+            spec.loader.exec_module(mod)
+        except Exception as e:
+            print(f"[tools] skipped {f.name}: {type(e).__name__}: {e}")
+            continue
+        for name, fn in vars(mod).items():
+            if name.endswith("_tool") and callable(fn):
+                found[name[:-len("_tool")]] = fn
+    return found
+
+
+TOOL_REGISTRY = {**CORE_TOOLS,
+                 **load_plugin_tools(Path(__file__).resolve().parent / "tools")}
 
 
 # -----------------------------
@@ -676,6 +814,86 @@ def _confirm_command(cmd: str) -> bool:
     return answer in ("y", "yes")
 
 
+FIX_PROMPT = """You fix one issue in one line of Python. Output ONLY the corrected \
+line(s), no explanation, no fences, no commentary. Preserve indentation exactly. \
+If the issue cannot be fixed by rewriting these lines, output UNFIXABLE."""
+
+DEBT_FILE = "DEBT.md"
+
+
+def _gather_findings(path: str, only: str = "") -> List[Dict[str, Any]]:
+    """Flatten lint output into individual findings, worst kinds first.
+
+    Uses the lint_file tool's own API, so any detector exposing the same shape
+    (overview -> top_issues, symbol=X -> occurrences) plugs in unchanged.
+    """
+    lint = TOOL_REGISTRY.get("lint_file")
+    if not lint:
+        return []
+    # One call. Running the detector once per symbol re-analyses the file for
+    # data the first run already had.
+    res = lint(filename=path, symbol=only or "*")
+    if "error" in res:
+        return [{"error": res["error"]}]
+    out = [{"symbol": o.get("symbol", only), "line": o["line"], "message": o["message"]}
+           for o in res.get("occurrences", [])]
+    return sorted(out, key=lambda f: f["line"])
+
+
+def _propose_fix(model: str, cfg: dict, layers_ref: list,
+                 lines: List[str], finding: Dict[str, Any]) -> str:
+    """Ask the model to rewrite one line. Deliberately does NOT use the agent
+    system prompt — one bounded decision needs ~200 tokens of context, not 593,
+    and nothing accumulates between findings."""
+    n = finding["line"]
+    lo, hi = max(n - 3, 0), min(n + 2, len(lines))
+    context = "".join(f"{i+1}: {lines[i]}" for i in range(lo, hi))
+    target = lines[n - 1].rstrip("\n")
+    msgs = [
+        {"role": "system", "content": FIX_PROMPT},
+        {"role": "user", "content": (
+            f"Issue: {finding['symbol']} — {finding['message']}\n\n"
+            f"Context:\n{context}\n"
+            f"Rewrite ONLY line {n}:\n{target}")},
+    ]
+    return (call_llm(model, msgs, gpu_layers=layers_ref, max_tokens=300,
+                     num_ctx=cfg["num_ctx"], token_budget=cfg["token_budget"]) or "").strip()
+
+
+def _defer(path: str, finding: Dict[str, Any], note: str = "") -> None:
+    """Deferred work goes to a ledger instead of evaporating."""
+    ledger = resolve_abs_path(DEBT_FILE)
+    with open(ledger, "a", encoding="utf-8") as f:
+        f.write(f"- [ ] {path}:{finding['line']} {finding['symbol']} — "
+                f"{finding['message']}{(' (' + note + ')') if note else ''}\n")
+
+
+def _render_result(result: dict) -> str:
+    """Full result for a human. _summarise_result is a one-line console echo
+    for the model's turn — direct /tool calls need the actual findings.
+
+    Generic on purpose: scalars as key: value, string lists as bullets, dict
+    lists as aligned rows. Works for any tool, including plugins added later.
+    """
+    out = []
+    for key, val in result.items():
+        if isinstance(val, list):
+            if not val:
+                continue
+            out.append(f"{key}:")
+            if isinstance(val[0], dict):
+                cols = list(val[0])
+                width = {c: max(len(c), *(len(str(r.get(c, ""))) for r in val)) for c in cols}
+                out.append("  " + "  ".join(c.ljust(width[c]) for c in cols))
+                for row in val:
+                    out.append("  " + "  ".join(str(row.get(c, "")).ljust(width[c]) for c in cols))
+            else:
+                out += [f"  {v}" for v in val]
+        else:
+            out.append(f"{key}: {val}")
+    return "\n".join(out)
+
+
 def _summarise_result(tool_name: str, result: dict) -> str:
     if "error" in result:
         return f"ERROR: {result['error']}  {result.get('hint', '')}"
@@ -693,6 +911,12 @@ def _summarise_result(tool_name: str, result: dict) -> str:
         return f"{result.get('action', 'done')} → {result.get('path', '?')}"
     if tool_name == "search_file":
         return f"{len(result.get('matches', []))} matches in {result.get('file_path', '?')}"
+    if tool_name == "lint_file":
+        if "symbol" in result:
+            return f"{result['count']}x {result['symbol']} in {result.get('file','?')}"
+        n = result.get("total", "?")
+        return (f"score {result.get('score','?')}/10, {n} messages"
+                f"  [{result.get('file','?')}]")
     if tool_name == "run_command":
         rc = result.get("returncode", "?")
         out = (result.get("stdout") or "").strip()
@@ -797,6 +1021,7 @@ def run(model: str, gpu_layers: int | None = None,
 
         if user.lower() in {"/help", "-h", "--help"}:
             print("  ".join(SLASH_COMMANDS))
+            print("tools: " + "  ".join(f"/{t}" for t in TOOL_REGISTRY))
             continue
 
         if user.lower() == "/ops":
@@ -894,20 +1119,120 @@ def run(model: str, gpu_layers: int | None = None,
                 print(f"[CWD] Note: only the path was used. Send the rest as a separate message.")
             continue
 
+        # /fix <file> [symbol] [max=N] — the loop that actually changes code.
+        # One finding at a time: context per iteration is constant, so a file
+        # with 300 findings works the same as one with 3.
+        if user.lower().startswith("/fix"):
+            _fp = user.split()
+            if len(_fp) < 2:
+                print("[Fix] usage: /fix <file> [symbol] [max=N]")
+                continue
+            _target = _fp[1]
+            _only = next((t for t in _fp[2:] if "=" not in t), "")
+            _cap = next((int(t.split("=")[1]) for t in _fp[2:]
+                         if t.startswith("max=")), 20)
+            _findings = _gather_findings(_target, _only)
+            if _findings and "error" in _findings[0]:
+                print(f"[Fix] {_findings[0]['error']}")
+                continue
+            if not _findings:
+                print("[Fix] Nothing to fix.")
+                continue
+
+            _path = resolve_abs_path(_target)
+            _fixed = _skipped = _deferred = 0
+            print(f"[Fix] {len(_findings)} findings in {_path.name}, "
+                  f"working through up to {_cap}.")
+            for _f in _findings[:_cap]:
+                _lines = _path.read_text(encoding="utf-8").splitlines(keepends=True)
+                if _f["line"] > len(_lines):
+                    continue
+                _old = _lines[_f["line"] - 1].rstrip("\n")
+                print(f"\n{ASSISTANT_COLOR}[{_f['symbol']}]{RESET_COLOR} "
+                      f"line {_f['line']}: {_f['message']}")
+                print(f"  - {_old}")
+                _new = _propose_fix(model, cfg, layers_ref, _lines, _f)
+                if not _new or _new == "UNFIXABLE":
+                    print("  (model could not fix this one)")
+                    _skipped += 1
+                    continue
+                print(f"  + {_new}")
+                try:
+                    _ans = input("  [f]ix / [s]kip / [d]efer / [q]uit: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    break
+                if _ans.startswith("q"):
+                    break
+                if _ans.startswith("f"):
+                    _r = edit_file_tool(str(_path), _old, _new)
+                    print(f"  {_summarise_result('edit_file', _r)}")
+                    _fixed += 1
+                elif _ans.startswith("d"):
+                    _defer(_target, _f)
+                    print(f"  deferred -> {DEBT_FILE}")
+                    _deferred += 1
+                else:
+                    _skipped += 1
+            print(f"\n[Fix] {_fixed} fixed, {_skipped} skipped, {_deferred} deferred.")
+            continue
+
+        # Any registered tool is callable as /name — including plugins dropped
+        # into tools/ later. Placed after the builtin slash commands so a tool
+        # can never shadow /help. Results print but do not enter the context:
+        # running a tool yourself informs you, not the model.
+        if user.startswith("/") and user.lstrip("/").split()[0] in TOOL_REGISTRY:
+            _parts = user.lstrip("/").split()
+            _fn = TOOL_REGISTRY[_parts[0]]
+            _sig = inspect.signature(_fn)
+            _params = list(_sig.parameters)
+
+            def _coerce(param: str, raw: str) -> Any:
+                """Typed from the annotation — CLI tokens are always strings."""
+                ann = _sig.parameters[param].annotation
+                if ann is int:
+                    return int(raw)
+                if ann is bool:
+                    return raw.lower() in ("1", "true", "yes", "y")
+                return raw
+
+            _args: Dict[str, Any] = {}
+            _pos = 0
+            for _tok in _parts[1:]:
+                _k = _tok.split("=", 1)[0]
+                if "=" in _tok and _k in _params:
+                    _args[_k] = _coerce(_k, _tok.split("=", 1)[1])
+                elif _pos < len(_params):
+                    _args[_params[_pos]] = _coerce(_params[_pos], _tok)
+                    _pos += 1
+            _missing = [q for q, prm in inspect.signature(_fn).parameters.items()
+                        if prm.default is inspect.Parameter.empty and q not in _args]
+            if _missing:
+                print(f"[{_parts[0]}] missing: {', '.join(_missing)}   "
+                      f"usage: /{_parts[0]} {' '.join(_params)}")
+            else:
+                try:
+                    print(_render_result(_fn(**_args)))
+                except Exception as _e:
+                    print(f"[{_parts[0]}] {type(_e).__name__}: {_e}")
+            continue
+
         # Shell command passthrough — if first word is an executable in PATH, run it directly
         _first = user.split()[0] if user.split() else ""
-        if _first and _first not in _PASSTHROUGH_SKIP and shutil.which(_first):
+        if (_first and shutil.which(_first)
+                and (_first not in _AMBIGUOUS_WORDS
+                     or _resolve_ambiguous(_first, user))):
             try:
-                result = subprocess.run(
-                    user, shell=True, capture_output=True, text=True,
-                    cwd=str(_agent_cwd[0]), timeout=60
-                )
-                if result.stdout:
-                    print(result.stdout, end="")
-                if result.stderr:
-                    print(result.stderr, end="")
-                if result.returncode != 0:
-                    print(f"[exit {result.returncode}]")
+                _out, _err, _rc, _capped = _run_capped(
+                    user, timeout=60, cwd=str(_agent_cwd[0]))
+                if _out:
+                    print(_out, end="")
+                if _err:
+                    print(_err, end="")
+                if _capped:
+                    print(f"\n[output capped at {MAX_CAPTURE_BYTES:,} bytes — command killed]")
+                elif _rc != 0:
+                    print(f"[exit {_rc}]")
             except KeyboardInterrupt:
                 print()
             continue

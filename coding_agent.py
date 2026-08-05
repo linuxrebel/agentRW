@@ -7,6 +7,7 @@ if sys.version_info < (3, 10):
     sys.exit(f"coding_agent.py needs Python 3.10+, found {sys.version.split()[0]}")
 
 import ast
+import concurrent.futures
 import inspect
 import json
 import os
@@ -72,7 +73,7 @@ RESET_COLOR     = "\033[0m"  if _ANSI else ""
 
 SLASH_COMMANDS = (
     "/help", "/model", "/gpu-layers", "/low-vram", "/compact", "/tokens",
-    "/reset", "/pwd", "/ops", "/olist", "/update", "/bye", "cd <path>",
+    "/reset", "/pwd", "/ops", "/olist", "/cloud-models", "/update", "/bye", "cd <path>",
 )
 
 _CHARS_PER_TOKEN = 4
@@ -574,7 +575,7 @@ def call_llm(model: str, messages: list, gpu_layers: "list[int | None]" = None,
                 print(f"\n{ASSISTANT_COLOR}[Error]{RESET_COLOR} Ollama server error (500): {e}")
             return ""
         except APIStatusError as e:
-            print(f"\n{ASSISTANT_COLOR}[Error]{RESET_COLOR} API error {e.status_code}: {e}")
+            print(f"\n{ASSISTANT_COLOR}[Error]{RESET_COLOR} {_api_error_text(e)}")
             return ""
 
 
@@ -626,6 +627,31 @@ def _collect_backtick_block() -> str:
 # Set by --yes. Off by default: a command the model proposes may have come
 # from text it read out of a file, not from you.
 _auto_approve = [False]
+
+
+def _is_cloud(model: str) -> bool:
+    """Cloud models carry a :cloud or -cloud suffix and run server-side."""
+    return model.endswith(":cloud") or model.endswith("-cloud")
+
+
+def _cloud_tag(name: str) -> str:
+    """Catalog name -> usable tag. 'kimi-k3' -> 'kimi-k3:cloud',
+    'gpt-oss:20b' -> 'gpt-oss:20b-cloud'."""
+    return f"{name}-cloud" if ":" in name else f"{name}:cloud"
+
+
+def _api_error_text(e) -> str:
+    """Readable one-liner from an OpenAI-style error, minus the JSON and ref id."""
+    msg = ""
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        msg = body.get("message") or body.get("error", {}).get("message", "") \
+            if isinstance(body.get("error"), dict) else body.get("message", "")
+    msg = (msg or str(e)).split(" (ref:")[0].strip()
+    if "requires a subscription" in msg:
+        return ("This model needs a paid Ollama plan. Free-tier models are marked "
+                "available in /cloud-models.  Upgrade: https://ollama.com/upgrade")
+    return msg
 
 
 def _confirm_command(cmd: str) -> bool:
@@ -716,12 +742,14 @@ def run(model: str, gpu_layers: int | None = None,
                 _new_model = parts[1].strip()
                 _ol = subprocess.run(["ollama", "list"], capture_output=True, text=True)
                 _known = [ln.split()[0] for ln in _ol.stdout.splitlines()[1:] if ln.strip()]
-                if _new_model in _known:
+                # Cloud models resolve server-side and need no local pull, so
+                # `ollama list` cannot vouch for them. Only the server knows.
+                if _new_model in _known or _is_cloud(_new_model):
                     model = _new_model
                     print(f"[Model] Switched to: {model}. Switch will complete once you run the first command with this model.")
                 else:
                     print(f"[Model] Not found locally: {_new_model}")
-                    print(f"[Model] Run `ollama pull {_new_model}` to download it, or /olist to see available models.")
+                    print(f"[Model] Run `ollama pull {_new_model}` to download it, /olist for local models, or /cloud-models for cloud ones.")
             else:
                 print(f"[Model] Current model: {model}")
             continue
@@ -780,6 +808,44 @@ def run(model: str, gpu_layers: int | None = None,
                 print(_r.stdout, end="")
             if _r.stderr:
                 print(_r.stderr, end="")
+            continue
+
+        if user.lower().startswith("/cloud-models"):
+            try:
+                with urllib.request.urlopen("https://ollama.com/api/tags", timeout=10) as _r:
+                    _tags = sorted(_cloud_tag(m["name"]) for m in json.load(_r)["models"])
+            except Exception as _e:
+                print(f"[Cloud] Could not reach ollama.com: {_e}")
+                continue
+            if user.lower().split()[1:2] == ["all"]:
+                print(f"[Cloud] {len(_tags)} cloud models in the catalog. "
+                      f"`/cloud-models` shows just the ones your plan covers.")
+                for _t in _tags:
+                    print(f"  {_t}")
+                continue
+
+            # Only the server knows what a plan covers, so ask it.
+            print(f"[Cloud] Checking {len(_tags)} models against your account...")
+
+            def _usable(tag):
+                try:
+                    client.chat.completions.create(
+                        model=tag, messages=[{"role": "user", "content": "hi"}], max_tokens=1)
+                    return tag
+                except Exception:
+                    return None
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as _pool:
+                _ok = [t for t in _pool.map(_usable, _tags) if t]
+
+            if _ok:
+                for _tag in _ok:
+                    print(f"  {_tag}")
+                print(f"[Cloud] {len(_ok)} available. "
+                      f"`/cloud-models all` lists the full catalog.")
+            else:
+                print("[Cloud] No cloud models available on this account.")
+                print("[Cloud] Run `ollama signin` in a terminal, or see https://ollama.com/upgrade")
             continue
 
         if user.lower() == "/olist":

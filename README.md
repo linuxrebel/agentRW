@@ -1,8 +1,36 @@
 # coding_agent
 
-A terminal CLI coding assistant that gives a local [Ollama](https://ollama.com) model interactive read/write/execute access to your filesystem — without ever leaving your terminal or sending data to the cloud.
+A terminal coding agent for hardware that can't run the big ones.
 
-One script, all platforms. Windows-specific behavior (config location, ANSI colors) is handled internally.
+Same shape as [OpenCode](https://opencode.ai), Claude Code, or Aider: you type at a
+prompt, a model reads and writes your files and runs commands, you stay in the
+terminal. The difference is what it's built around.
+
+Those tools assume a capable frontier model and spend context freely — large system
+prompts, whole files in the window, rich scaffolding. That's the right call when
+you're driving Claude or GPT through an API.
+
+**This one assumes the opposite.** It targets a 7B model on a 4 GB GPU, where the
+scarce resource is not model capability but the context window. Every design choice
+follows from that:
+
+- The system prompt is **539 tokens** — 26% of a 2048-token window, measured and
+  trimmed rather than guessed at.
+- Shell commands run *directly*, never through the model. Typing `ls` or `git status`
+  costs zero tokens.
+- Tools return summaries, not dumps.
+- One file, ~1030 lines, standard library plus the `openai` client.
+
+It is a **harness, not a critic**: it writes what the model produces and leaves
+judging the result to you. An earlier version validated content before writing and
+that turned out to be the single biggest source of apparent "bad model output" —
+see `CLAUDE.md`.
+
+Runs fully local against [Ollama](https://ollama.com), so nothing leaves your
+machine unless you point it at a cloud model on purpose.
+
+**Not for you if** you have API access to a frontier model and no hardware
+constraint — use OpenCode or Claude Code, which do far more with that budget.
 
 ---
 
@@ -22,27 +50,32 @@ pip install -r requirements.txt
 
 ## Installation
 
-### Linux / macOS
+One script runs everywhere — `coding_agent.py`. Platform differences (config
+location, ANSI colors) are handled inside it. All that differs below is how you put
+it on your `PATH`.
+
+**Linux / macOS**
 
 ```bash
 chmod +x coding_agent.py
 ln -s "$PWD/coding_agent.py" ~/.local/bin/coding_agent
 ```
 
-### Windows
+**Windows** — run it directly:
 
 ```powershell
 python coding_agent.py <model-name>
 ```
 
-To call it without the `.py` extension, save a `coding_agent.bat` somewhere on your `PATH`:
+Or save a `coding_agent.bat` on your `PATH` to drop the extension:
 
 ```bat
 @echo off
 python C:\path\to\coding_agent.py %*
 ```
 
-Config lives in `%APPDATA%\coding_agent\config.json` on Windows, `~/.config/coding_agent/config.json` elsewhere.
+Config lives in `~/.config/coding_agent/config.json`, or
+`%APPDATA%\coding_agent\config.json` on Windows.
 
 ---
 
@@ -62,6 +95,63 @@ coding_agent <model-name> --low-vram
 ```
 
 After that, `coding_agent` alone uses the saved default. Passing a different model prompts you to update it.
+
+---
+
+## Cloud Models
+
+Ollama proxies cloud-tagged models through the same local endpoint the agent
+already talks to, so **no configuration change is needed** — the agent cannot tell
+the difference.
+
+Sign in once, in a normal terminal:
+
+```bash
+ollama signin
+```
+
+Do this *outside* the agent. Slash commands and the shell passthrough capture
+output rather than attaching a terminal, so an interactive auth flow would hang
+until it times out. It is one-time machine setup, not a session command.
+
+Then just use one. **No pull needed** — cloud models resolve server-side:
+
+```bash
+coding_agent gpt-oss:20b-cloud
+```
+
+`/model gpt-oss:20b-cloud` also works mid-session.
+
+To see what your plan actually covers:
+
+```
+/cloud-models          # models you can actually use, nothing else
+/cloud-models all      # the full catalog
+```
+
+The default checks against your account, because nothing in the API advertises
+entitlement — availability is only discoverable by asking. On a free account
+roughly a third of the catalog comes back usable. `all` is a plain catalog
+listing and makes no API calls.
+
+**`ollama pull` proves nothing.** It fetches a manifest, and the subscription is
+only checked at inference time, so a pull of a model you cannot use still
+succeeds. Use `/cloud-models check`, not a successful pull.
+
+**Your code leaves your machine.** Everything else in this README describes a
+fully local setup; a `:cloud` tag sends file contents and commands to Ollama's
+servers. That is the trade, and the one reason to think before typing the tag.
+
+**Local-only flags are ignored, not errors.** `--low-vram` and `--gpu-layers`
+become `num_gpu`/`num_ctx` inference options for hardware you are no longer
+using; cloud endpoints accept and discard them (verified — identical token
+counts with `num_gpu` at 0, 99, or unset). The context-trimming budget is tuned
+for a small window and will trim history a large cloud model could hold, so
+raise it if you work this way often.
+
+**Non-Ollama APIs** (Moonshot direct, OpenRouter, anything else OpenAI-compatible)
+are a different case — `base_url` and `api_key` are currently hardcoded near the
+top of `coding_agent.py` and would need editing.
 
 ---
 

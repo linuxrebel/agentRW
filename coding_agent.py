@@ -678,6 +678,24 @@ def proactive_trim(messages: list, budget_tokens: int = TOKEN_BUDGET) -> int:
 # -----------------------------
 # LLM call
 # -----------------------------
+def _canonical_command(word: str) -> str:
+    """Map a slash command to its real name, tolerating the obvious typos.
+
+    Exact match wins, then a toggled trailing 's' (/models, /cloud-model),
+    then an unambiguous prefix (/lint -> /lint_file, /read -> /read_file).
+    Ambiguous prefixes are left alone so they fall through to the model.
+    """
+    known = {c[1:] for c in SLASH_COMMANDS if c.startswith("/")} | set(TOOL_REGISTRY)
+    w = word.lstrip("/").lower()
+    if w in known:
+        return w
+    swapped = w[:-1] if w.endswith("s") else w + "s"
+    if swapped in known:
+        return swapped
+    hits = [k for k in known if k.startswith(w)]
+    return hits[0] if len(hits) == 1 else w
+
+
 def _tools_schema() -> List[Dict[str, Any]]:
     """OpenAI tool schema, derived from the same registry the prompt uses.
 
@@ -1046,6 +1064,15 @@ def run(model: str, gpu_layers: int | None = None,
             user = _collect_backtick_block().strip()
             if not user:
                 continue
+
+        # Normalise slash typos once, up front, so every handler below sees the
+        # canonical name: /models -> /model, /cloud-model -> /cloud-models,
+        # /lint -> /lint_file.
+        if user.startswith("/"):
+            _head, _sep, _tail = user.partition(" ")
+            _canon = _canonical_command(_head)
+            if _canon != _head.lstrip("/").lower():
+                user = f"/{_canon}{_sep}{_tail}"
 
         if user.lower() in {"exit", "quit", "/bye", "/exit", "/quit", "bye"}:
             print("Goodbye.")

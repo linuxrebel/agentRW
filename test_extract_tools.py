@@ -283,6 +283,22 @@ def test_native_tool_calls_are_read():
     assert params["properties"]["start_line"]["type"] == "integer", params
 
 
+def test_command_aliases():
+    """Common slash typos resolve; ambiguous ones are left alone."""
+    import coding_agent as ca
+    c = ca._canonical_command
+    assert c("/lint") == "lint_file"            # unique prefix
+    assert c("/models") == "model"              # plural toggle
+    assert c("/cloud-model") == "cloud-models"  # singular toggle
+    assert c("/token") == "tokens"
+    assert c("/read") == "read_file"
+    assert c("/model") == "model"               # exact wins over toggle
+    assert c("/cloud-models") == "cloud-models"
+    assert c("/help") == "help"
+    assert c("/c") == "c"                       # ambiguous: compact/cloud-models
+    assert c("/nosuchthing") == "nosuchthing"   # unknown falls through
+
+
 def test_json_tool_call_format():
     """Sending a tools schema makes some models answer with the JSON call
     object as plain text. qwen2.5-coder does this on ~2 turns in 3, and it
@@ -311,6 +327,7 @@ def test_json_tool_call_format():
 if __name__ == "__main__":
     test_extract_tools()
     test_native_tool_calls_are_read()
+    test_command_aliases()
     test_json_tool_call_format()
     test_output_is_capped()
     test_fix_loop_pieces()

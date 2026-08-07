@@ -5,3 +5,6 @@ __pycache__/
 
 # Backups written by write_file / edit_file
 *.bak
+
+# Built release tarballs
+release/

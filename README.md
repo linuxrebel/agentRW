@@ -70,31 +70,89 @@ stay dormant and say so; nothing else is affected.
 ## Installation
 
 One script runs everywhere — `coding_agent.py`. Platform differences (config
-location, ANSI colors) are handled inside it. All that differs below is how you put
-it on your `PATH`.
+location, ANSI colours) are handled inside it. Only the installer differs.
 
-**Linux / macOS**
+Build a release tarball from a checkout:
 
 ```bash
-chmod +x coding_agent.py
-ln -s "$PWD/coding_agent.py" ~/.local/bin/coding_agent
+./build-release.sh          # writes release/agentRW-<version>.tar.gz
 ```
 
-**Windows** — run it directly:
+### Linux / macOS — system-wide
 
-```powershell
-python coding_agent.py <model-name>
+```bash
+tar -xzf agentRW-1.2.6.tar.gz
+sudo ./agentRW-1.2.6/install.sh
 ```
 
-Or save a `coding_agent.bat` on your `PATH` to drop the extension:
+Needs root, because it writes to `/opt` and `/usr/local/bin`. Run it without
+`sudo` and it tells you so and stops — it does not half-install.
 
-```bat
-@echo off
-python C:\path\to\coding_agent.py %*
+### Windows — per-user, no admin
+
+```
+tar -xzf agentRW-1.2.6.tar.gz
+agentRW-1.2.6\install.bat
 ```
 
-Config lives in `~/.config/coding_agent/config.json`, or
-`%APPDATA%\coding_agent\config.json` on Windows.
+Installs under `%LOCALAPPDATA%`, so no administrator rights are needed.
+
+Deliberately *not* `Program Files`: that needs admin **and** a system `PATH`
+edit, and `setx /M` silently truncates `PATH` at 1024 characters. Per-user is
+what VS Code and most developer CLIs do on Windows.
+
+**Open a new terminal afterwards** — `PATH` changes do not reach terminals that
+are already running.
+
+### What gets installed, and where
+
+| | Linux / macOS | Windows |
+|---|---|---|
+| program | `/opt/agentRW/` | `%LOCALAPPDATA%\Programs\agentRW\` |
+| launcher | symlink `/usr/local/bin/cagent` | `cagent.bat` in the install dir, added to your user `PATH` |
+| plugins | `/opt/agentRW/tools/` | `…\agentRW\tools\` |
+| your config | `~/.config/coding_agent/` | `%APPDATA%\coding_agent\` |
+| privilege | root | none |
+
+The install directory holds `coding_agent.py`, `requirements.txt`, the docs,
+`tools/`, and the uninstaller. Nothing is written anywhere else.
+
+On Windows the launcher is a `.bat` shim rather than a symlink — symlinks need
+admin or developer mode. Because it is on `PATH`, `cagent` works from
+PowerShell, cmd and Windows Terminal alike; no `$PROFILE` alias is added and
+your profile is not touched.
+
+**Upgrading** re-runs the installer. `tools/` is copied aside and restored, so
+plugins you installed survive.
+
+### Python packages
+
+The installer does not run `pip`. It prints what to run, because installing
+packages as root on top of a distro Python is a good way to break it:
+
+```bash
+pip install --user -r /opt/agentRW/requirements.txt
+```
+
+### Running it
+
+```bash
+cagent                      # your saved default model
+cagent qwen2.5-coder:7b     # a specific model, saved as default on first use
+cagent --low-vram           # 4 GB preset, trims the prompt to 539 tokens
+cagent --help               # every flag
+```
+
+### Uninstalling
+
+```bash
+sudo /opt/agentRW/uninstall.sh              # Linux / macOS
+%LOCALAPPDATA%\Programs\agentRW\uninstall.bat   # Windows
+```
+
+Both list any installed plugins by name before asking, since removing the
+program removes them too. Your config, `DEBT.md` files and `.bak` files are
+left alone.
 
 ---
 

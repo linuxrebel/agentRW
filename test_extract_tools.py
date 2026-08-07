@@ -107,33 +107,75 @@ def test_lint_file_summarises():
     assert lint(os.path.join(work, "gone.py"))["error"] == "file_not_found"
 
 
+def _make_plugin(root, owner, name, body, files=("plugin.py",), api=1,
+                 requires=("thing",)):
+    """Write a plugin in the tools/<owner>/<name>/ layout."""
+    pkg = root / owner / name
+    pkg.mkdir(parents=True, exist_ok=True)
+    (pkg / "plugin.py").write_text(body)
+    (pkg / "install.md").write_text(
+        f"# {owner}/{name} 1.0.0\n\ndesc\n\n## Files\n"
+        + "".join(f"- {f}\n" for f in files)
+        + "\n## Requires\n" + "".join(f"- {r}\n" for r in requires)
+        + f"\n## API\n{api}\n")
+    return pkg
+
+
 def test_plugin_loading():
-    """Dropping a .py into tools/ installs a tool; removing it uninstalls."""
+    """A plugin is tools/<owner>/<name>/ with an install.md declaring its files."""
     import coding_agent as ca
     d = pathlib.Path(tempfile.mkdtemp())
 
-    assert ca.load_plugin_tools(d) == {}                    # empty dir
-    assert ca.load_plugin_tools(d / "nope") == {}           # missing dir
+    assert ca.load_plugins(d) == {}                          # empty
+    assert ca.load_plugins(d / "nope") == {}                 # missing
 
-    (d / "demo.py").write_text(
-        "def demo_tool(x: str) -> dict:\n"
-        '    """Demo."""\n'
-        "    return {'x': x}\n")
-    (d / "_skipme.py").write_text("def hidden_tool(): return {}\n")
-    (d / "broken.py").write_text("def oops_tool(\n")        # syntax error
+    _make_plugin(d, "me", "demo",
+                 "def demo_tool(x: str) -> dict:\n"
+                 '    """Demo."""\n'
+                 "    return {'x': x}\n")
+    # declared but absent, and present but undeclared
+    _make_plugin(d, "me", "partial", "def ghost_tool(): return {}\n",
+                 files=("plugin.py", "missing.py"))
+    (d / "me" / "partial" / "sneaky.py").write_text("def sneaky_tool(): return {}\n")
+    _make_plugin(d, "me", "broken", "def oops_tool(\n")      # syntax error
+    _make_plugin(d, "me", "future", "def soon_tool(): return {}\n", api=99)
+    (d / "me" / "notaplugin").mkdir()                        # no install.md
 
-    found = ca.load_plugin_tools(d)
+    ca.PLUGIN_STATUS.clear()
+    found = ca.load_plugins(d)
+
     assert "demo" in found, found                            # discovered
-    assert "hidden" not in found, found                      # _prefix skipped
-    assert "oops" not in found, found                        # broken isolated
     assert found["demo"](x="hi") == {"x": "hi"}              # and it runs
+    assert "ghost" in found, found                           # missing file skipped,
+    assert "sneaky" not in found, found                      # undeclared never runs
+    assert "oops" not in found, found                        # broken isolated
+    assert "soon" not in found, found                        # api too new
 
     # A discovered tool must be indistinguishable from a core one to the prompt.
-    fn = found["demo"]
-    assert fn.__doc__ and str(inspect.signature(fn))
+    assert found["demo"].__doc__ and str(inspect.signature(found["demo"]))
 
-    (d / "demo.py").unlink()
-    assert "demo" not in ca.load_plugin_tools(d)             # uninstalled
+    import shutil as _sh
+    _sh.rmtree(d / "me" / "demo")
+    assert "demo" not in ca.load_plugins(d)                  # uninstalled
+
+
+def test_install_md_parsing():
+    """install.md is markdown so it renders on a forge. Malformed is the
+    author's problem — we return what was readable and refuse."""
+    import coding_agent as ca
+    d = pathlib.Path(tempfile.mkdtemp())
+    p = d / "install.md"
+
+    p.write_text("# owner/thing 2.1.0\n\ndesc\n\n## Files\n- a.py\n- data.json\n"
+                 "\n## Requires\n- pylint\n\n## API\n1\n")
+    m = ca.read_install_md(p)
+    assert m["name"] == "owner/thing" and m["version"] == "2.1.0", m
+    assert m["files"] == ["a.py", "data.json"], m
+    assert m["requires"] == ["pylint"] and m["api"] == 1, m
+
+    p.write_text("nothing useful here\n")                    # malformed
+    m = ca.read_install_md(p)
+    assert m["files"] == [] and m.get("name") is None, m     # readable, empty
 
 
 def test_ui_arg_mapping():
@@ -336,6 +378,7 @@ if __name__ == "__main__":
     test_ui_arg_mapping()
     test_lint_file_summarises()
     test_plugin_loading()
+    test_install_md_parsing()
     test_writes_are_scoped()
     test_command_confirmation_defaults_to_no()
     print("ok")

@@ -461,8 +461,104 @@ def plugin_context(model: str, cfg: dict, layers_ref: list):
     )
 
 
+def read_install_md(path: Path) -> Dict[str, Any]:
+    """Parse a plugin's install.md. Markdown so it renders on a forge.
+
+        # owner/name 1.0.0
+        one-line description
+        ## Files
+        - plugin.py
+        ## Requires
+        - pylint
+        ## API
+        1
+
+    Malformed is the author's problem, not ours: return what was readable and
+    let the caller refuse. No schema, no validation, no guessing.
+    """
+    meta: Dict[str, Any] = {"files": [], "requires": [], "api": 1}
+    section = None
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line.startswith("# ") and "name" not in meta:
+            bits = line[2:].split()
+            meta["name"] = bits[0] if bits else ""
+            meta["version"] = bits[1] if len(bits) > 1 else "0"
+        elif line.startswith("## "):
+            section = line[3:].strip().lower()
+        elif line.startswith("- ") and section in ("files", "requires"):
+            meta[section].append(line[2:].strip())
+        elif line and section == "api" and line.isdigit():
+            meta["api"] = int(line)
+    return meta
+
+
+def _load_one(pkg: Path, found: Dict[str, Any]) -> None:
+    """Load one plugin directory: tools/<owner>/<name>/ with an install.md."""
+    ident = f"{pkg.parent.name}/{pkg.name}"
+    meta = {}
+    try:
+        meta = read_install_md(pkg / "install.md")
+    except Exception as e:
+        print(f"[tools] {ident}: unreadable install.md — {e}")
+        PLUGIN_STATUS.append({"file": ident, "error": f"install.md: {e}"})
+        return
+
+    if meta.get("api", 1) > PLUGIN_API:
+        print(f"[tools] {ident} needs plugin API {meta['api']}, this is {PLUGIN_API}")
+        PLUGIN_STATUS.append({"file": ident, "name": meta.get("name", ident),
+                              "error": f"needs API {meta['api']}, host is {PLUGIN_API}"})
+        return
+
+    tools, cmds = [], []
+    for rel in meta["files"]:
+        if not rel.endswith(".py"):
+            continue                      # data the plugin declared, not code
+        f = pkg / rel
+        if not f.is_file():
+            print(f"[tools] {ident}: declared file missing: {rel}")
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(
+                f"{pkg.parent.name}_{pkg.name}_{f.stem}", f)
+            mod = importlib.util.module_from_spec(spec)
+            # Plugins need the agent's cwd, not the process cwd — `cd` only
+            # moves _agent_cwd. Injected, so plugins stay importable standalone.
+            mod.__dict__["resolve_abs_path"] = resolve_abs_path
+            mod.__dict__["PLUGIN_DIR"] = pkg
+            # The harness module is deliberately NOT injected. ctx is the whole
+            # surface a plugin gets, so reaching into internals has to be a
+            # visible act (an explicit import) rather than the default.
+            spec.loader.exec_module(mod)
+        except Exception as e:
+            print(f"[tools] skipped {ident}/{rel}: {type(e).__name__}: {e}")
+            PLUGIN_STATUS.append({"file": ident, "error": f"{type(e).__name__}: {e}"})
+            return
+        for name, fn in vars(mod).items():
+            if name.endswith("_tool") and callable(fn):
+                found[name[:-len("_tool")]] = fn
+                tools.append(name[:-len("_tool")])
+            elif name.endswith("_command") and callable(fn):
+                # First registration wins a command name. tools.json will own
+                # this binding once it exists — see FUTURES.md.
+                short = name[:-len("_command")]
+                if short in PLUGIN_COMMANDS:
+                    print(f"[tools] {ident}: /{short} already taken, command skipped")
+                    continue
+                PLUGIN_COMMANDS[short] = fn
+                cmds.append("/" + short)
+
+    PLUGIN_STATUS.append({
+        "file": ident, "name": meta.get("name", ident),
+        "version": meta.get("version", "?"), "tools": tools, "commands": cmds,
+        "requires": {r: {} for r in meta["requires"]},
+    })
+
+
 def load_plugins(d: Path) -> Dict[str, Any]:
-    """Discover plugins in d/*.py. Two naming conventions, no other API:
+    """Discover plugins in d/<owner>/<name>/, each with an install.md.
+
+    Two naming conventions, no other API:
 
         *_tool     -> a tool the model can call, and /name
         *_command  -> a slash command /name
@@ -473,42 +569,23 @@ def load_plugins(d: Path) -> Dict[str, Any]:
             def lint_command(ctx, args): ...
 
     If the requirement is missing the def never runs, so the command is never
-    registered — absent rather than disabled. REQUIRES documents what is needed
-    so /plugins can say why something is dormant and how to install it.
+    registered — absent rather than disabled.
 
-    Drop a file in to install, move it out to uninstall. A broken plugin is
-    skipped with a warning rather than taking the harness down with it.
+    Only files the plugin declares in install.md are imported. Anything else in
+    the directory is the plugin's own business — config, data, its README.
+    A broken plugin is skipped with a warning rather than taking the harness
+    down with it.
     """
     found: Dict[str, Any] = {}
     if not d.is_dir():
         return found
-    for f in sorted(d.glob("*.py")):
-        if f.name.startswith("_"):
+    for owner in sorted(p for p in d.iterdir() if p.is_dir()):
+        if owner.name.startswith((".", "_")):
             continue
-        try:
-            spec = importlib.util.spec_from_file_location(f.stem, f)
-            mod = importlib.util.module_from_spec(spec)
-            # Plugins need the agent's cwd, not the process cwd — `cd` only
-            # moves _agent_cwd. Injected, so plugins stay importable standalone.
-            mod.__dict__["resolve_abs_path"] = resolve_abs_path
-            # The harness module is deliberately NOT injected. ctx is the whole
-            # surface a plugin gets, so reaching into internals has to be a
-            # visible act (an explicit import) rather than the default.
-            spec.loader.exec_module(mod)
-        except Exception as e:
-            print(f"[tools] skipped {f.name}: {type(e).__name__}: {e}")
-            PLUGIN_STATUS.append({"file": f.name, "error": f"{type(e).__name__}: {e}"})
-            continue
-        tools, cmds = [], []
-        for name, fn in vars(mod).items():
-            if name.endswith("_tool") and callable(fn):
-                found[name[:-len("_tool")]] = fn
-                tools.append(name[:-len("_tool")])
-            elif name.endswith("_command") and callable(fn):
-                PLUGIN_COMMANDS[name[:-len("_command")]] = fn
-                cmds.append("/" + name[:-len("_command")])
-        PLUGIN_STATUS.append({"file": f.name, "tools": tools, "commands": cmds,
-                              "requires": getattr(mod, "REQUIRES", {})})
+        for pkg in sorted(p for p in owner.iterdir() if p.is_dir()):
+            if (pkg / "install.md").is_file():
+                _load_one(pkg, found)
+    return found
     return found
 
 

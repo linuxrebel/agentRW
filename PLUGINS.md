@@ -1,10 +1,64 @@
 # Writing a plugin
 
-A plugin is one ordinary Python file in `tools/`. It adds tools the model can
-call and slash commands you can type. There is no framework to learn: two
-naming conventions and one object handed to your command.
+A plugin is a directory containing ordinary Python and an `install.md`. It adds
+tools the model can call and slash commands you can type. There is no framework
+to learn: two naming conventions and one object handed to your command.
 
-Nothing imports your file explicitly. Nothing registers it. It is discovered.
+Nothing imports your files explicitly. Nothing registers them. They are
+discovered.
+
+```
+tools/linuxrebel/lint/
+  install.md      what you are, what you ship, what you need
+  plugin.py       the code
+  README.md       optional, for humans
+```
+
+Plugins live in their own git repos and are namespaced by owner, so two authors
+can both publish a `lint` and both can be installed.
+
+---
+
+## install.md
+
+Markdown, so it renders on GitHub and GitLab where people will read it.
+
+```markdown
+# linuxrebel/lint 1.0.0
+
+Interactive pylint session — walks findings one at a time.
+
+## Files
+- plugin.py
+- symbols.json
+
+## Requires
+- pylint
+- autopep8
+
+## API
+1
+```
+
+| section | meaning |
+|---|---|
+| heading | `owner/name version` — your namespaced identity |
+| `## Files` | **every file you ship.** Only declared `.py` files are imported |
+| `## Requires` | executables you need, reported by `/plugins` when missing |
+| `## API` | lowest `ctx.api` you work against. A host older than this refuses to load you, and says why |
+
+Declaring your files is not bookkeeping. An undeclared `.py` sitting in your
+directory is **never imported**, so nothing can be smuggled in alongside a
+legitimate plugin. It is also what lets an installer extract only what you
+listed.
+
+If `install.md` is malformed the plugin is refused. That is the author's
+problem — the harness reports what it could not read and moves on.
+
+Your directory is otherwise yours. Config, caches, data, tests: keep what you
+like beside your code. `/plugins` reports registered plugins only and ignores
+the rest. `PLUGIN_DIR` is injected into your module so you can find your own
+files.
 
 ---
 
@@ -219,18 +273,15 @@ whole point of the design is that a plugin is one readable file.
 
 ## Uninstalling
 
-Move the file out of `tools/`. The tools and commands disappear with it.
-
-Anything else you keep in `tools/` — config, cache, data — is your business.
-`/plugins` reports registered plugins only and ignores everything else.
+Remove the directory. The tools and commands disappear with it.
 
 ---
 
 ## Worked example
 
-`tools/format.py` is the smallest complete plugin: one tool, a `REQUIRES`
-block, a clear error when autopep8 is absent, and no command.
+`tools/linuxrebel/format/` is the smallest complete plugin: one tool, a
+`REQUIRES` block, a clear error when autopep8 is absent, and no command.
 
-`tools/lint.py` is the full shape: a tool, a gated command, `help`, plain
+`tools/linuxrebel/lint/` is the full shape: a tool, a gated command, `help`, plain
 English translation of a detector's messages, and per-finding classification of
 how a fix can be applied.

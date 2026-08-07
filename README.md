@@ -217,8 +217,17 @@ Every tool is also callable directly — `/read_file foo.py start_line=50` — a
 
 ## Plugins
 
-Drop a `.py` file into `tools/`. It is discovered — no registration, no manifest,
-no code changes. Two naming conventions are the whole API:
+A plugin is a directory with an `install.md` and some Python, namespaced by
+owner so two authors can both publish a `lint`:
+
+```
+tools/linuxrebel/lint/
+  install.md      identity, files, requirements, API version
+  plugin.py       the code
+```
+
+It is discovered — no registration call, no code changes. Two naming
+conventions are the whole API:
 
 | suffix | becomes |
 |---|---|
@@ -257,8 +266,8 @@ Two plugins ship with the agent:
 
 | plugin | provides | needs |
 |---|---|---|
-| `tools/lint.py` | `lint_file`, `/lint` | pylint |
-| `tools/format.py` | `format_file` | autopep8 |
+| `linuxrebel/lint` | `lint_file`, `/lint` | pylint, autopep8 |
+| `linuxrebel/format` | `format_file` | autopep8 |
 
 **`/lint <file>`** walks pylint findings one at a time — fix, skip, ignore the
 whole kind, defer to `DEBT.md`, or see the raw message. It explains what each

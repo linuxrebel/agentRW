@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import types
 import threading
 import urllib.request
 from pathlib import Path
@@ -116,7 +117,8 @@ RESET_COLOR     = "\033[0m"  if _ANSI else ""
 
 SLASH_COMMANDS = (
     "/help", "/model", "/gpu-layers", "/low-vram", "/compact", "/tokens",
-    "/reset", "/pwd", "/lint", "/ops", "/olist", "/cloud-models", "/update", "/bye", "cd <path>",
+    "/reset", "/pwd", "/plugins", "/tools", "/ops", "/olist", "/cloud-models", "/update",
+    "/bye", "cd <path>",
 )
 
 _CHARS_PER_TOKEN = 4
@@ -423,12 +425,56 @@ CORE_TOOLS = {
 }
 
 
-def load_plugin_tools(d: Path) -> Dict[str, Any]:
-    """Discover tools in d/*.py. Any callable named *_tool becomes a tool.
+PLUGIN_COMMANDS: Dict[str, Any] = {}    # name -> callable(ctx, args)
+PLUGIN_STATUS: List[Dict[str, Any]] = []  # what /plugins reports
 
-    That convention is the entire plugin API — no decorator, no manifest, no
-    registration call. build_prompt() reads inspect.signature() and __doc__,
-    so a discovered tool is indistinguishable from a core one.
+# The plugin API. Everything a command may rely on is here and nothing else,
+# so the harness can rename or restructure its internals without breaking
+# third-party plugins. Add to it freely; change or remove only with a version
+# bump. Plugins should read ctx.api and refuse to run on a version they do not
+# understand.
+PLUGIN_API = 1
+
+
+def plugin_context(model: str, cfg: dict, layers_ref: list):
+    """Build the ctx handed to a plugin command."""
+    return types.SimpleNamespace(
+        api=PLUGIN_API,
+        # session
+        model=model, cfg=cfg, layers=layers_ref, cwd=_agent_cwd[0],
+        tools=TOOL_REGISTRY,
+        # paths and writing
+        resolve_path=resolve_abs_path,
+        writable=_writable,
+        write_denied=_write_denied,
+        # the finding pipeline
+        gather_findings=_gather_findings,
+        propose_fix=_propose_or_compute,
+        apply_fix=_apply_fix,
+        finish_run=_finish_run,
+        defer=_defer,
+        debt_file=DEBT_FILE,
+        # output
+        summarise=_summarise_result,
+        render=_render_result,
+        colour=ASSISTANT_COLOR, reset=RESET_COLOR,
+    )
+
+
+def load_plugins(d: Path) -> Dict[str, Any]:
+    """Discover plugins in d/*.py. Two naming conventions, no other API:
+
+        *_tool     -> a tool the model can call, and /name
+        *_command  -> a slash command /name
+
+    A plugin gates itself on whatever it needs by defining conditionally:
+
+        if shutil.which("pylint"):
+            def lint_command(ctx, args): ...
+
+    If the requirement is missing the def never runs, so the command is never
+    registered — absent rather than disabled. REQUIRES documents what is needed
+    so /plugins can say why something is dormant and how to install it.
 
     Drop a file in to install, move it out to uninstall. A broken plugin is
     skipped with a warning rather than taking the harness down with it.
@@ -445,27 +491,70 @@ def load_plugin_tools(d: Path) -> Dict[str, Any]:
             # Plugins need the agent's cwd, not the process cwd — `cd` only
             # moves _agent_cwd. Injected, so plugins stay importable standalone.
             mod.__dict__["resolve_abs_path"] = resolve_abs_path
+            # The harness module is deliberately NOT injected. ctx is the whole
+            # surface a plugin gets, so reaching into internals has to be a
+            # visible act (an explicit import) rather than the default.
             spec.loader.exec_module(mod)
         except Exception as e:
             print(f"[tools] skipped {f.name}: {type(e).__name__}: {e}")
+            PLUGIN_STATUS.append({"file": f.name, "error": f"{type(e).__name__}: {e}"})
             continue
+        tools, cmds = [], []
         for name, fn in vars(mod).items():
             if name.endswith("_tool") and callable(fn):
                 found[name[:-len("_tool")]] = fn
+                tools.append(name[:-len("_tool")])
+            elif name.endswith("_command") and callable(fn):
+                PLUGIN_COMMANDS[name[:-len("_command")]] = fn
+                cmds.append("/" + name[:-len("_command")])
+        PLUGIN_STATUS.append({"file": f.name, "tools": tools, "commands": cmds,
+                              "requires": getattr(mod, "REQUIRES", {})})
     return found
 
 
+# Kept: the old name is what the tests and any external caller use.
+load_plugin_tools = load_plugins
+
 TOOL_REGISTRY = {**CORE_TOOLS,
-                 **load_plugin_tools(Path(__file__).resolve().parent / "tools")}
+                 **load_plugins(Path(__file__).resolve().parent / "tools")}
 
 
 # -----------------------------
 # Prompt builder
 # -----------------------------
+MAX_DOC_CHARS = 240
+
+
+def _safe_doc(fn) -> str:
+    """A tool's docstring goes into the system prompt verbatim, every turn.
+
+    That makes it the one channel where plugin-authored text reaches the model
+    directly — an injection route ("ignore all previous instructions...") and a
+    way to quietly spend the token budget. Capped, flattened, and stripped of
+    control characters. Prose beyond the cap is the plugin author's problem.
+    """
+    doc = " ".join((fn.__doc__ or "").split())
+    doc = "".join(c for c in doc if c.isprintable())
+    return doc[:MAX_DOC_CHARS] + ("…" if len(doc) > MAX_DOC_CHARS else "")
+
+
+# Tools the model is TOLD about. Dispatch matches TOOL_REGISTRY, so a tool left
+# out of this set is still callable — it just is not advertised, and its
+# docstring stops being re-sent on every single request. That distinction is
+# the whole point: the system prompt is not loaded once, it is paid for per turn.
+_active_tools = {n for n, f in TOOL_REGISTRY.items()
+                 if getattr(f, "model_facing", True)}
+
+
+def tool_cost(name: str) -> int:
+    fn = TOOL_REGISTRY[name]
+    return len(f"\n{name}\n{inspect.signature(fn)}\n{_safe_doc(fn)}\n\n----------------\n") // 4
+
+
 def build_prompt() -> str:
     tools = "".join(
-        f"\n{name}\n{inspect.signature(fn)}\n{fn.__doc__}\n\n----------------\n"
-        for name, fn in TOOL_REGISTRY.items()
+        f"\n{name}\n{inspect.signature(fn)}\n{_safe_doc(fn)}\n\n----------------\n"
+        for name, fn in TOOL_REGISTRY.items() if name in _active_tools
     )
     dirs = "\n".join(f"  {d}" for d in [_agent_cwd[0], *_extra_write_dirs])
     return SYSTEM_PROMPT.replace("{{tool_list_repr}}", tools) \
@@ -691,7 +780,8 @@ def _canonical_command(word: str) -> str:
     then an unambiguous prefix (/lint -> /lint_file, /read -> /read_file).
     Ambiguous prefixes are left alone so they fall through to the model.
     """
-    known = {c[1:] for c in SLASH_COMMANDS if c.startswith("/")} | set(TOOL_REGISTRY)
+    known = ({c[1:] for c in SLASH_COMMANDS if c.startswith("/")}
+             | set(TOOL_REGISTRY) | set(PLUGIN_COMMANDS))
     w = word.lstrip("/").lower()
     if w in known:
         return w
@@ -1267,8 +1357,19 @@ def run(model: str, gpu_layers: int | None = None,
 
         if user.lower() == "/low-vram":
             cfg.update(LOW_VRAM_PRESET)
+            # Also stop advertising plugin tools. On a 2048-token window their
+            # docstrings are a real fraction of the budget, re-sent every turn,
+            # and they stay callable as /name regardless.
+            _dropped = _active_tools - set(CORE_TOOLS)
+            _active_tools.intersection_update(CORE_TOOLS)
+            messages[0] = {"role": "system", "content": build_prompt()}
             print(f"[Low-VRAM] Applied preset: max_tokens={cfg['max_tokens']}, "
                   f"num_ctx={cfg['num_ctx']}, token_budget={cfg['token_budget']}")
+            if _dropped:
+                print(f"[Low-VRAM] Unadvertised {', '.join(sorted(_dropped))} "
+                      f"— prompt now {len(build_prompt())//4} tokens "
+                      f"({len(build_prompt())//4*100//cfg['num_ctx']}% of the window). "
+                      f"Still callable with /name or `/tools on <name>`.")
             continue
 
         if user.lower().startswith("/gpu-layers"):
@@ -1296,7 +1397,62 @@ def run(model: str, gpu_layers: int | None = None,
 
         if user.lower() in {"/help", "-h", "--help"}:
             print("  ".join(SLASH_COMMANDS))
-            print("tools: " + "  ".join(f"/{t}" for t in TOOL_REGISTRY))
+            print("tools:   " + "  ".join(f"/{t}" for t in TOOL_REGISTRY))
+            if PLUGIN_COMMANDS:
+                print("plugins: " + "  ".join(f"/{c}" for c in PLUGIN_COMMANDS))
+            continue
+
+        if user.lower().startswith("/tools"):
+            _ta = user.split()[1:]
+            _verb = _ta[0].lower() if _ta else ""
+            if _verb in ("on", "off") and len(_ta) > 1:
+                for _n in _ta[1:]:
+                    if _n not in TOOL_REGISTRY:
+                        print(f"[Tools] no such tool: {_n}")
+                    elif _verb == "on":
+                        _active_tools.add(_n)
+                    else:
+                        _active_tools.discard(_n)
+            elif _verb == "core":
+                _active_tools.intersection_update(CORE_TOOLS)
+            elif _verb == "all":
+                _active_tools.update(TOOL_REGISTRY)
+            elif _verb:
+                print("[Tools] usage: /tools [on|off <name>...] [core] [all]")
+                continue
+
+            if _verb:
+                # The system prompt is re-sent every turn, so rebuilding it is
+                # what actually changes the cost from here on.
+                messages[0] = {"role": "system", "content": build_prompt()}
+            _tot = sum(tool_cost(n) for n in _active_tools)
+            for _n in TOOL_REGISTRY:
+                _on = _n in _active_tools
+                print(f"  {'[x]' if _on else '[ ]'} {_n:14} {tool_cost(_n):3d} tok"
+                      f"{'' if _on else '   (callable, not advertised)'}")
+            print(f"[Tools] {len(_active_tools)}/{len(TOOL_REGISTRY)} advertised, "
+                  f"{_tot} tokens per turn. Prompt is now "
+                  f"{len(build_prompt())//4} tokens.")
+            continue
+
+        if user.lower() == "/plugins":
+            # Only registered plugins. Anything else in tools/ is a plugin's own
+            # business — config, data, whatever it wants to keep beside itself.
+            if not PLUGIN_STATUS:
+                print("[Plugins] none registered.")
+            for _p in PLUGIN_STATUS:
+                if _p.get("error"):
+                    print(f"  {_p['file']:14} FAILED   {_p['error']}")
+                    continue
+                _bits = ([f"tools: {', '.join(_p['tools'])}"] if _p["tools"] else []) + \
+                        ([f"commands: {', '.join(_p['commands'])}"] if _p["commands"] else [])
+                _live = "ACTIVE " if (_p["tools"] or _p["commands"]) else "DORMANT"
+                print(f"  {_p['file']:14} {_live}  {'; '.join(_bits)}")
+                for _need, _how in (_p.get("requires") or {}).items():
+                    _ok = shutil.which(_need)
+                    print(f"      needs {_need}: {'found' if _ok else 'MISSING'}"
+                          + ("" if _ok else
+                             "   " + "  ".join(f"{k}: {v}" for k, v in _how.items())))
             continue
 
         if user.lower() == "/ops":
@@ -1397,150 +1553,16 @@ def run(model: str, gpu_layers: int | None = None,
             if not _rest:
                 continue
             user = _rest
-
-        # /lint <file> [symbol] [max=N] — the interactive session. A report you
-        # cannot act on is not the point; this walks findings one at a time.
-        # One finding at a time: context per iteration is constant, so a file
-        # with 300 findings works the same as one with 3.
-        if user.lower().startswith("/lint"):
-            _fp = user.split()
-            if len(_fp) < 2:
-                print("[Lint] usage: /lint <file> [symbol] [max=N]")
-                continue
-            _target = _fp[1]
-            _only = next((t for t in _fp[2:] if "=" not in t), "")
-            _cap = next((int(t.split("=")[1]) for t in _fp[2:]
-                         if t.startswith("max=")), 20)
-            _findings = _gather_findings(_target, _only)
-            if _findings and "error" in _findings[0]:
-                print(f"[Lint] {_findings[0]['error']}")
-                continue
-            if not _findings:
-                print("[Lint] Nothing to fix.")
-                continue
-
-            _path = resolve_abs_path(_target)
-            _snapshot = _path.read_text(encoding="utf-8")   # for end-of-run revert
-            _fixed = _skipped = _deferred = _ignored = 0
-            _done_kinds: set = set()
-            print(f"[Lint] {len(_findings)} findings in {_path.name}, "
-                  f"working through up to {_cap}.")
-            # Style findings are batched for autopep8 after the loop. Asking
-            # about whitespace 11 times is noise, and there is nothing to decide.
-            _style = [f for f in _findings if f.get("action_kind") == "format"]
-            _findings = [f for f in _findings if f.get("action_kind") != "format"]
-            if _style:
-                print(f"[Lint] {len(_style)} style findings "
-                      f"({', '.join(sorted({f['symbol'] for f in _style}))}) "
-                      f"— autopep8 will fix these at the end, no questions.")
-
-            for _f in _findings[:_cap]:
-                if _f["symbol"] in _done_kinds:      # ignored mid-run
-                    _ignored += 1
-                    continue
-                _lines = _path.read_text(encoding="utf-8").splitlines(keepends=True)
-                if _f["line"] > len(_lines):
-                    continue
-                _old = _lines[_f["line"] - 1].rstrip("\n")
-                _kind0 = _f.get("action_kind", "line")
-                if _kind0 == "line" and not _old.strip():
-                    # Rewriting a blank line has no meaning, and an empty old_str
-                    # is what used to wipe the file.
-                    print(f"\n{ASSISTANT_COLOR}[{_f['symbol']}]{RESET_COLOR} "
-                          f"line {_f['line']}: blank line — nothing to rewrite, skipped")
-                    _skipped += 1
-                    continue
-                _same = sum(1 for x in _findings if x["symbol"] == _f["symbol"])
-                print(f"\n{ASSISTANT_COLOR}[{_f['symbol']}]{RESET_COLOR} "
-                      f"line {_f['line']}"
-                      + (f"   ({_same} of this kind)" if _same > 1 else ""))
-                _kind = _f.get("action_kind", "line")
-                print(f"  meaning: {_f.get('meaning') or _f['message']}")
-                print(f"  action : {_f.get('action', 'rewrite the line')}")
-                if _f.get("note"):
-                    print(f"  note   : {_f['note']}")
-
-                # action_kind decides HOW to fix, never whether to offer one.
-                # Asking for a line rewrite regardless is how a rename finding
-                # turned into a shebang edit.
-                _new = ""
-                if _kind.startswith(("reindent", "line", "insert")):
-                    _new = _propose_or_compute(model, cfg, layers_ref, _lines, _f)
-                    if not _new:
-                        print("  (no fix could be produced)")
-                    elif _kind.startswith("reindent"):
-                        print(f"  - {_old}")
-                        print(f"  + {_new}   (computed, no model)")
-                    elif _kind == "line":
-                        print(f"  - {_old}")
-                        print(f"  + {_new}")
-                    else:
-                        print(f"  + {_new}   (inserted, nothing overwritten)")
-                elif _kind == "rename":
-                    _new = str(_path.with_name(
-                        _path.stem.replace("-", "_").lower() + _path.suffix))
-                    print(f"  + {_path.name} -> {Path(_new).name}")
-
-                _choices = ("  [f]ix / [s]kip / [i]gnore kind / [d]efer / [r]aw / [q]uit: "
-                            if _new else
-                            "  [s]kip / [i]gnore kind / [d]efer / [r]aw / [q]uit: ")
-                while True:
-                    try:
-                        _ans = input(_choices).strip().lower()
-                    except (EOFError, KeyboardInterrupt):
-                        print()
-                        _ans = "q"
-                    if _ans.startswith("r"):
-                        print(f"  pylint : {_f.get('raw') or _f['message']}")
-                        continue          # re-prompt, decision still pending
-                    break
-
-                if _ans.startswith("q"):
-                    break
-                if _new and _ans.startswith("f"):
-                    if _kind != "rename":
-                        _r = _apply_fix(_path, _lines, _f, _new)
-                        print(f"  {_summarise_result('write_file', _r)}")
-                    elif _kind == "rename":
-                        _dest = Path(_new)
-                        if not _writable(_path) or not _writable(_dest):
-                            print(f"  {_write_denied(_dest)['hint']}")
-                        elif _dest.exists():
-                            print(f"  {_dest.name} already exists — not renaming.")
-                        else:
-                            _path.rename(_dest)
-                            print(f"  renamed -> {_dest}")
-                            _path = _dest
-                    _fixed += 1
-                elif _ans.startswith("i"):
-                    # "this doesn't matter" — drop the rest of this kind for the
-                    # rest of the run. Nothing is written anywhere.
-                    _done_kinds.add(_f["symbol"])
-                    print(f"  ignoring {_f['symbol']} for this run"
-                          f"{f' ({_same} findings)' if _same > 1 else ''}")
-                    _ignored += 1
-                elif _ans.startswith("d"):
-                    _defer(_target, _f)
-                    print(f"  deferred -> {DEBT_FILE}")
-                    _deferred += 1
-                else:
-                    _skipped += 1
-            # After the model edits, not before: autopep8 also repairs the
-            # indentation of anything the model inserted.
-            if _style and "format_file" in TOOL_REGISTRY:
-                _fr = TOOL_REGISTRY["format_file"](filename=str(_path))
-                if "error" in _fr:
-                    print(f"\n[Lint] autopep8: {_fr['error']}")
-                else:
-                    print(f"\n[Lint] autopep8 fixed {len(_style)} style findings "
-                          f"({_fr.get('changed', 0)} lines changed, no model used).")
-                    _fixed += len(_style)
-
-            print(f"\n[Lint] {_fixed} fixed, {_skipped} skipped, "
-                  f"{_ignored} ignored, {_deferred} deferred.")
-            if not _finish_run(_path, _snapshot):
-                print(f"{ASSISTANT_COLOR}[Lint]{RESET_COLOR} The result no longer "
-                      f"compiles — all changes reverted. {_path.name} is as it was.")
+        # Plugin commands. A plugin that gates itself on a missing tool never
+        # registers one, so /lint simply does not exist without pylint — it
+        # falls through to the model like any other unknown word.
+        _cw = user.lstrip("/").split()[0].lower() if user.startswith("/") else ""
+        if _cw in PLUGIN_COMMANDS:
+            _ctx = plugin_context(model, cfg, layers_ref)
+            try:
+                PLUGIN_COMMANDS[_cw](_ctx, user.split(None, 1)[1] if " " in user else "")
+            except Exception as _e:
+                print(f"[{_cw}] {type(_e).__name__}: {_e}")
             continue
 
         # Any registered tool is callable as /name — including plugins dropped
@@ -1874,6 +1896,9 @@ if __name__ == "__main__":
     )
     if effective_flags.get("low_vram"):
         kwargs.update(LOW_VRAM_PRESET)
+        # Same automation at startup: a 2048-token window cannot afford to
+        # advertise tools it will not use. They remain callable as /name.
+        _active_tools.intersection_update(CORE_TOOLS)
         if effective_flags.get("num_ctx") is not None:        kwargs["num_ctx"]    = effective_flags["num_ctx"]
         if effective_flags.get("max_tokens", 2000) != 2000:   kwargs["max_tokens"] = effective_flags["max_tokens"]
     run(model, **kwargs)

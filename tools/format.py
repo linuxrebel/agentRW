@@ -46,8 +46,16 @@ def format_file_tool(filename: str, aggressive: str = "") -> Dict[str, Any]:
     if after == before:
         return {"file": str(p), "changed": 0, "note": "already conforms"}
 
+
     b, a_ = before.splitlines(), after.splitlines()
     changed = sum(1 for i in range(max(len(b), len(a_)))
                   if (b[i] if i < len(b) else None) != (a_[i] if i < len(a_) else None))
     return {"file": str(p), "changed": changed,
             "note": "style only — indentation and whitespace, no logic changes"}
+
+
+# Not model-facing: /lint calls this directly and the model never needs to know
+# it exists. Keeping it out of the system prompt saves ~57 tokens on EVERY turn
+# — the prompt is re-sent with every request, so an unused tool is not a
+# one-time cost. Still callable as /format_file and by ctx.tools.
+format_file_tool.model_facing = False

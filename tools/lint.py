@@ -12,6 +12,7 @@ The rule that makes that work: aggregate, never dump.
 
 import json
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Dict
@@ -213,3 +214,177 @@ def lint_file_tool(filename: str, symbol: str = "") -> Dict[str, Any]:
         "next": f"/lint {filename} — step through these interactively "
                 f"(or /lint {filename} <symbol> for one kind)",
     }
+
+
+# ---------------------------------------------------------------------------
+# The /lint command. Defined only when pylint is present, so without it the
+# command is never registered and /lint falls through to the model rather than
+# existing in a broken state. The gate is ordinary Python — no plugin API.
+# ---------------------------------------------------------------------------
+REQUIRES = {
+    "pylint": {"pip": "pylint", "fedora": "python3-pylint", "debian": "pylint"},
+}
+
+if shutil.which("pylint"):
+
+    def lint_command(ctx, args: str) -> None:
+        """Walk lint findings one at a time: fix / skip / ignore / defer."""
+        # Required of every plugin command: `/name help` explains itself.
+        if args.strip().lower() in ("help", "-h", "--help"):
+            print("""/lint <file> [symbol] [max=N]
+
+Walks pylint findings one at a time. For each you choose:
+  [f]ix          apply the change shown
+  [s]kip         leave it, ask again next run
+  [i]gnore kind  drop every finding of this kind for this run
+  [d]efer        record it in DEBT.md and move on
+  [r]aw          show pylint's original message, then ask again
+  [q]uit         stop here, keep what has been applied
+
+  symbol   only findings of one kind, e.g. /lint foo.py unused-import
+  max=N    stop after N findings (default 20)
+
+Style findings are not asked about — autopep8 fixes them all at the end.
+If the finished file does not compile, the whole run is reverted.
+Requires: pylint (findings), autopep8 (style fixes).""")
+            return
+
+        _fp = ["/lint"] + args.split()
+        if len(_fp) < 2:
+            print("[Lint] usage: /lint <file> [symbol] [max=N]")
+            return
+        _target = _fp[1]
+        _only = next((t for t in _fp[2:] if "=" not in t), "")
+        _cap = next((int(t.split("=")[1]) for t in _fp[2:]
+                     if t.startswith("max=")), 20)
+        _findings = ctx.gather_findings(_target, _only)
+        if _findings and "error" in _findings[0]:
+            print(f"[Lint] {_findings[0]['error']}")
+            return
+        if not _findings:
+            print("[Lint] Nothing to fix.")
+            return
+
+        _path = ctx.resolve_path(_target)
+        _snapshot = _path.read_text(encoding="utf-8")   # for end-of-run revert
+        _fixed = _skipped = _deferred = _ignored = 0
+        _done_kinds: set = set()
+        print(f"[Lint] {len(_findings)} findings in {_path.name}, "
+              f"working through up to {_cap}.")
+        # Style findings are batched for autopep8 after the loop. Asking
+        # about whitespace 11 times is noise, and there is nothing to decide.
+        _style = [f for f in _findings if f.get("action_kind") == "format"]
+        _findings = [f for f in _findings if f.get("action_kind") != "format"]
+        if _style:
+            print(f"[Lint] {len(_style)} style findings "
+                  f"({', '.join(sorted({f['symbol'] for f in _style}))}) "
+                  f"— autopep8 will fix these at the end, no questions.")
+
+        for _f in _findings[:_cap]:
+            if _f["symbol"] in _done_kinds:      # ignored mid-run
+                _ignored += 1
+                return
+            _lines = _path.read_text(encoding="utf-8").splitlines(keepends=True)
+            if _f["line"] > len(_lines):
+                return
+            _old = _lines[_f["line"] - 1].rstrip("\n")
+            _kind0 = _f.get("action_kind", "line")
+            if _kind0 == "line" and not _old.strip():
+                # Rewriting a blank line has no meaning, and an empty old_str
+                # is what used to wipe the file.
+                print(f"\n{ctx.colour}[{_f['symbol']}]{ctx.reset} "
+                      f"line {_f['line']}: blank line — nothing to rewrite, skipped")
+                _skipped += 1
+                return
+            _same = sum(1 for x in _findings if x["symbol"] == _f["symbol"])
+            print(f"\n{ctx.colour}[{_f['symbol']}]{ctx.reset} "
+                  f"line {_f['line']}"
+                  + (f"   ({_same} of this kind)" if _same > 1 else ""))
+            _kind = _f.get("action_kind", "line")
+            print(f"  meaning: {_f.get('meaning') or _f['message']}")
+            print(f"  action : {_f.get('action', 'rewrite the line')}")
+            if _f.get("note"):
+                print(f"  note   : {_f['note']}")
+
+            # action_kind decides HOW to fix, never whether to offer one.
+            # Asking for a line rewrite regardless is how a rename finding
+            # turned into a shebang edit.
+            _new = ""
+            if _kind.startswith(("reindent", "line", "insert")):
+                _new = ctx.propose_fix(ctx.model, ctx.cfg, ctx.layers, _lines, _f)
+                if not _new:
+                    print("  (no fix could be produced)")
+                elif _kind.startswith("reindent"):
+                    print(f"  - {_old}")
+                    print(f"  + {_new}   (computed, no model)")
+                elif _kind == "line":
+                    print(f"  - {_old}")
+                    print(f"  + {_new}")
+                else:
+                    print(f"  + {_new}   (inserted, nothing overwritten)")
+            elif _kind == "rename":
+                _new = str(_path.with_name(
+                    _path.stem.replace("-", "_").lower() + _path.suffix))
+                print(f"  + {_path.name} -> {Path(_new).name}")
+
+            _choices = ("  [f]ix / [s]kip / [i]gnore kind / [d]efer / [r]aw / [q]uit: "
+                        if _new else
+                        "  [s]kip / [i]gnore kind / [d]efer / [r]aw / [q]uit: ")
+            while True:
+                try:
+                    _ans = input(_choices).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    _ans = "q"
+                if _ans.startswith("r"):
+                    print(f"  pylint : {_f.get('raw') or _f['message']}")
+                    continue          # re-prompt, decision still pending
+                break
+
+            if _ans.startswith("q"):
+                break
+            if _new and _ans.startswith("f"):
+                if _kind != "rename":
+                    _r = ctx.apply_fix(_path, _lines, _f, _new)
+                    print(f"  {ctx.summarise('write_file', _r)}")
+                elif _kind == "rename":
+                    _dest = Path(_new)
+                    if not ctx.writable(_path) or not ctx.writable(_dest):
+                        print(f"  {ctx.write_denied(_dest)['hint']}")
+                    elif _dest.exists():
+                        print(f"  {_dest.name} already exists — not renaming.")
+                    else:
+                        _path.rename(_dest)
+                        print(f"  renamed -> {_dest}")
+                        _path = _dest
+                _fixed += 1
+            elif _ans.startswith("i"):
+                # "this doesn't matter" — drop the rest of this kind for the
+                # rest of the run. Nothing is written anywhere.
+                _done_kinds.add(_f["symbol"])
+                print(f"  ignoring {_f['symbol']} for this run"
+                      f"{f' ({_same} findings)' if _same > 1 else ''}")
+                _ignored += 1
+            elif _ans.startswith("d"):
+                ctx.defer(_target, _f)
+                print(f"  deferred -> {ctx.debt_file}")
+                _deferred += 1
+            else:
+                _skipped += 1
+        # After the model edits, not before: autopep8 also repairs the
+        # indentation of anything the model inserted.
+        if _style and "format_file" in ctx.tools:
+            _fr = ctx.tools["format_file"](filename=str(_path))
+            if "error" in _fr:
+                print(f"\n[Lint] autopep8: {_fr['error']}")
+            else:
+                print(f"\n[Lint] autopep8 fixed {len(_style)} style findings "
+                      f"({_fr.get('changed', 0)} lines changed, no model used).")
+                _fixed += len(_style)
+
+        print(f"\n[Lint] {_fixed} fixed, {_skipped} skipped, "
+              f"{_ignored} ignored, {_deferred} deferred.")
+        if not ctx.finish_run(_path, _snapshot):
+            print(f"{ctx.colour}[Lint]{ctx.reset} The result no longer "
+                  f"compiles — all changes reverted. {_path.name} is as it was.")
+        return

@@ -190,7 +190,9 @@ def test_fix_loop_pieces():
     assert len(calls) == 1, calls
     assert len(found) >= 3, found
     assert all({"line", "symbol", "message"} <= set(f) for f in found), found
-    assert found == sorted(found, key=lambda f: f["line"])
+    # Descending: an edit shifts every line below it, so working bottom-up keeps
+    # unvisited line numbers valid. Ascending left 13 of 17 findings stale.
+    assert found == sorted(found, key=lambda f: -f["line"])
 
     # apply
     assert ca.edit_file_tool(str(src), "x=1", "x = 1")["action"] == "edited"
@@ -287,7 +289,7 @@ def test_command_aliases():
     """Common slash typos resolve; ambiguous ones are left alone."""
     import coding_agent as ca
     c = ca._canonical_command
-    assert c("/lint") == "lint_file"            # unique prefix
+    assert c("/lint") == "lint"                 # the interactive session
     assert c("/models") == "model"              # plural toggle
     assert c("/cloud-model") == "cloud-models"  # singular toggle
     assert c("/token") == "tokens"

@@ -5,3 +5,16 @@ prompt_toolkit>=3.0.0
 
 # Windows only: ANSI colors on consoles that lack native VT support.
 colorama>=0.4.6; sys_platform == "win32"
+
+# Used by the tools/ plugins. Each degrades to a clear error if absent, so
+# they are optional — but /lint is far weaker without them, because every
+# finding a tool cannot fix has to be sent to a model instead.
+#
+# PACKAGING NOTE: these are also distro packages (Fedora: python3-pylint,
+# python3-autopep8; Debian/Ubuntu: pylint, python3-autopep8). Installing them
+# with pip on top of a distro copy is a known way to break a system Python.
+# When an installer exists it should either use the distro package or install
+# into a venv — not pip into the system interpreter. The plugins invoke these
+# as executables on PATH, so either source works.
+pylint>=3.0.0        # tools/lint.py   — finds issues
+autopep8>=2.0.0      # tools/format.py — fixes every style issue, no model

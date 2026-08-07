@@ -116,7 +116,7 @@ RESET_COLOR     = "\033[0m"  if _ANSI else ""
 
 SLASH_COMMANDS = (
     "/help", "/model", "/gpu-layers", "/low-vram", "/compact", "/tokens",
-    "/reset", "/pwd", "/fix", "/ops", "/olist", "/cloud-models", "/update", "/bye", "cd <path>",
+    "/reset", "/pwd", "/lint", "/ops", "/olist", "/cloud-models", "/update", "/bye", "cd <path>",
 )
 
 _CHARS_PER_TOKEN = 4
@@ -255,6 +255,12 @@ def edit_file_tool(path: str, old_str: str, new_str: str) -> Dict[str, Any]:
         return _write_denied(p)
     try:
         if old_str == "":
+            # Only ever a creation. On an existing file this used to replace the
+            # whole thing, so a lint finding on a blank line destroyed the file.
+            if p.exists():
+                return {"error": "empty_old_str_on_existing_file", "path": str(p),
+                        "hint": "old_str is empty and the file exists. Use write_file "
+                                "to replace it, or give the exact text to replace."}
             p.write_text(new_str, encoding="utf-8")
             return {"path": str(p), "action": "created"}
 
@@ -922,9 +928,17 @@ def _confirm_command(cmd: str) -> bool:
     return answer in ("y", "yes")
 
 
-FIX_PROMPT = """You fix one issue in one line of Python. Output ONLY the corrected \
-line(s), no explanation, no fences, no commentary. Preserve indentation exactly. \
-If the issue cannot be fixed by rewriting these lines, output UNFIXABLE."""
+# Deliberately does NOT say "preserve indentation exactly". For a
+# bad-indentation finding the indentation IS the fix, and that instruction made
+# gemma4 return the line with no indentation at all, 3 times out of 3.
+FIX_PROMPT = """You rewrite ONE line of Python to fix one specific issue. Output \
+ONLY that line, no explanation, no fences, no commentary. Keep the leading \
+whitespace correct for the surrounding block. Change nothing except what the \
+issue asks for. If rewriting this line cannot fix the issue, output UNFIXABLE."""
+
+INSERT_PROMPT = """You write ONE new line of Python to insert into a file. Output \
+ONLY that line, no explanation, no fences, no commentary. Match the surrounding \
+indentation exactly. If you cannot, output UNFIXABLE."""
 
 DEBT_FILE = "DEBT.md"
 
@@ -943,9 +957,13 @@ def _gather_findings(path: str, only: str = "") -> List[Dict[str, Any]]:
     res = lint(filename=path, symbol=only or "*")
     if "error" in res:
         return [{"error": res["error"]}]
-    out = [{"symbol": o.get("symbol", only), "line": o["line"], "message": o["message"]}
-           for o in res.get("occurrences", [])]
-    return sorted(out, key=lambda f: f["line"])
+    # Detectors may attach meaning / action_kind / action / raw. Carried through
+    # verbatim — the harness reads them but owns none of that knowledge.
+    out = [{**o, "symbol": o.get("symbol", only)} for o in res.get("occurrences", [])]
+    # Descending: an insert or edit shifts every line BELOW it, so working from
+    # the bottom up means a finding's line number is still valid when reached.
+    # Ascending left 13 of 17 findings pointing at lines that no longer existed.
+    return sorted(out, key=lambda f: -f["line"])
 
 
 def _propose_fix(model: str, cfg: dict, layers_ref: list,
@@ -957,16 +975,155 @@ def _propose_fix(model: str, cfg: dict, layers_ref: list,
     lo, hi = max(n - 3, 0), min(n + 2, len(lines))
     context = "".join(f"{i+1}: {lines[i]}" for i in range(lo, hi))
     target = lines[n - 1].rstrip("\n")
-    msgs = [
-        {"role": "system", "content": FIX_PROMPT},
-        {"role": "user", "content": (
-            f"Issue: {finding['symbol']} — {finding['message']}\n\n"
-            f"Context:\n{context}\n"
-            f"Rewrite ONLY line {n}:\n{target}")},
-    ]
-    return (call_llm(model, msgs, gpu_layers=layers_ref, max_tokens=300,
-                     num_ctx=cfg["num_ctx"], token_budget=cfg["token_budget"],
-                     send_tools=False) or "").strip()
+    kind = finding.get("action_kind", "line")
+    if kind in ("insert_after", "insert_top"):
+        where = "at the very top of the file" if kind == "insert_top" \
+            else f"immediately after line {n}"
+        msgs = [
+            {"role": "system", "content": INSERT_PROMPT},
+            {"role": "user", "content": (
+                f"Issue: {finding['symbol']} — {finding['message']}\n"
+                f"Goal: {finding.get('action', '')}\n\n"
+                f"Context:\n{context}\n"
+                f"Write the ONE line to insert {where}.")},
+        ]
+    else:
+        msgs = [
+            {"role": "system", "content": FIX_PROMPT},
+            {"role": "user", "content": (
+                f"Issue: {finding['symbol']} — {finding['message']}\n"
+                # The detector already worked out what the fix is. Withholding
+                # it left the model with the complaint and no instruction.
+                f"Goal: {finding.get('action', 'fix the issue on this line')}\n\n"
+                f"Context:\n{context}\n"
+                f"Rewrite ONLY line {n}:\n{target}")},
+        ]
+    raw = call_llm(model, msgs, gpu_layers=layers_ref, max_tokens=300,
+                   num_ctx=cfg["num_ctx"], token_budget=cfg["token_budget"],
+                   send_tools=False) or ""
+    return _clean_proposal(raw)
+
+
+def _parses(text: str) -> bool:
+    try:
+        compile(text, "<check>", "exec")
+        return True
+    except SyntaxError:
+        return False
+
+
+def _apply_checked(path: Path, before: str, after: str) -> Dict[str, Any]:
+    """Write `after`. Validation happens at the END of a run, not per edit.
+
+    Per-edit checking looks right and is wrong: changing one line from 2-space
+    to 4-space indentation leaves it inconsistent with its not-yet-fixed
+    siblings, so the file does not parse mid-run even though the finished set
+    does. Vetoing each edit cut a run from 16 fixes to 4 and the score from
+    9.57 to 4.35. `before` is kept in the signature so callers read as
+    intentional; see _finish_run for where the check actually lives.
+    """
+    return write_file_tool(str(path), after)
+
+
+def _finish_run(path: Path, snapshot: str) -> bool:
+    """After all edits: if a parseable file is now broken, put it back.
+
+    True if the file is fine (or was already broken before we started).
+    """
+    if path.suffix != ".py" or not _parses(snapshot):
+        return True
+    if _parses(path.read_text(encoding="utf-8")):
+        return True
+    path.write_text(snapshot, encoding="utf-8")
+    return False
+
+
+def _apply_fix(path: Path, lines: List[str], finding: Dict[str, Any],
+               new: str) -> Dict[str, Any]:
+    """Apply one fix according to its action_kind. The ONLY place that decides
+    replace-vs-insert.
+
+    Three separate bugs came from callers reimplementing this: a driver that
+    inserted reindented lines instead of replacing them, one that skipped the
+    shebang check, and one that bypassed the write guard. Callers pass a
+    finding and a line; they do not get to choose the operation.
+    """
+    kind = finding.get("action_kind", "line")
+    if kind == "line" or kind.startswith("reindent"):
+        out = list(lines)
+        out[finding["line"] - 1] = new + "\n"
+    elif kind.startswith("insert"):
+        out = _apply_insert(lines, finding, new)
+    else:
+        return {"error": "no_automatic_fix", "action_kind": kind}
+    return _apply_checked(path, "".join(lines), "".join(out))
+
+
+def _propose_or_compute(model: str, cfg: dict, layers_ref: list,
+                        lines: List[str], finding: Dict[str, Any]) -> str:
+    """The fix for a finding — computed when the detector already knows it,
+    generated only when judgement is genuinely required."""
+    kind = finding.get("action_kind", "line")
+    if kind.startswith("reindent"):
+        want = int(kind.split(":")[1]) if ":" in kind else 4
+        return " " * want + lines[finding["line"] - 1].lstrip().rstrip("\n")
+    return _propose_fix(model, cfg, layers_ref, lines, finding)
+
+
+def _apply_insert(lines: List[str], finding: Dict[str, Any], new: str) -> List[str]:
+    """Insert `new` for an insert_top / insert_after finding.
+
+    One implementation, so a caller cannot get a different answer than /lint —
+    a test driver with its own copy of this logic reported a shebang fix as
+    working when it had never run.
+    """
+    if finding.get("action_kind") == "insert_top":
+        # A shebang only works as line 1. Inserting above it satisfies pylint
+        # and silently breaks ./script.py.
+        at, indent = (1 if lines and lines[0].startswith("#!") else 0), ""
+    else:
+        at = finding["line"]
+        # Match the indentation the body ACTUALLY uses, not def-indent + 4.
+        # A file indented with 2 spaces got a 4-space docstring and every
+        # function broke with "unindent does not match any outer indentation
+        # level" — the docstring must join the block, not impose PEP 8 on it.
+        indent = ""
+        for nxt in lines[finding["line"]:]:
+            if nxt.strip():
+                indent = re.match(r'\s*', nxt).group(0)
+                break
+        own = re.match(r'\s*', lines[finding["line"] - 1]).group(0)
+        if len(indent) <= len(own):
+            # `def f(): pass` — the body is on the def line, so there is no
+            # block to join. Inserting anywhere here is a syntax error.
+            return list(lines)
+    out = list(lines)
+    out.insert(at, f"{indent}{new.strip()}\n")
+    return out
+
+
+def _clean_proposal(raw: str) -> str:
+    """One usable line, or "" — never partly-usable garbage.
+
+    Weaker models wrap answers in ``` fences, emit several lines when one was
+    asked for, and bury the word UNFIXABLE inside a fence. All of that used to
+    be written to the file verbatim.
+
+    Leading whitespace is never stripped: for a bad-indentation fix, the leading
+    whitespace IS the fix.
+    """
+    if "UNFIXABLE" in raw.upper():
+        return ""
+    lines = [ln for ln in raw.rstrip().splitlines()
+             if ln.strip() and not re.match(r'^\s*```', ln)]
+    if len(lines) != 1:
+        return ""          # nothing, or prose where one line was required
+    one = lines[0].rstrip()
+    # Also strip INLINE backticks. qwen returned `"""..."""` wrapped in single
+    # backticks, which the fence rule missed and which went into the file as a
+    # syntax error.
+    m = re.match(r'^(\s*)`+(.*?)`+$', one)
+    return f"{m.group(1)}{m.group(2)}" if m else one
 
 
 def _defer(path: str, finding: Dict[str, Any], note: str = "") -> None:
@@ -1241,13 +1398,14 @@ def run(model: str, gpu_layers: int | None = None,
                 continue
             user = _rest
 
-        # /fix <file> [symbol] [max=N] — the loop that actually changes code.
+        # /lint <file> [symbol] [max=N] — the interactive session. A report you
+        # cannot act on is not the point; this walks findings one at a time.
         # One finding at a time: context per iteration is constant, so a file
         # with 300 findings works the same as one with 3.
-        if user.lower().startswith("/fix"):
+        if user.lower().startswith("/lint"):
             _fp = user.split()
             if len(_fp) < 2:
-                print("[Fix] usage: /fix <file> [symbol] [max=N]")
+                print("[Lint] usage: /lint <file> [symbol] [max=N]")
                 continue
             _target = _fp[1]
             _only = next((t for t in _fp[2:] if "=" not in t), "")
@@ -1255,48 +1413,134 @@ def run(model: str, gpu_layers: int | None = None,
                          if t.startswith("max=")), 20)
             _findings = _gather_findings(_target, _only)
             if _findings and "error" in _findings[0]:
-                print(f"[Fix] {_findings[0]['error']}")
+                print(f"[Lint] {_findings[0]['error']}")
                 continue
             if not _findings:
-                print("[Fix] Nothing to fix.")
+                print("[Lint] Nothing to fix.")
                 continue
 
             _path = resolve_abs_path(_target)
-            _fixed = _skipped = _deferred = 0
-            print(f"[Fix] {len(_findings)} findings in {_path.name}, "
+            _snapshot = _path.read_text(encoding="utf-8")   # for end-of-run revert
+            _fixed = _skipped = _deferred = _ignored = 0
+            _done_kinds: set = set()
+            print(f"[Lint] {len(_findings)} findings in {_path.name}, "
                   f"working through up to {_cap}.")
+            # Style findings are batched for autopep8 after the loop. Asking
+            # about whitespace 11 times is noise, and there is nothing to decide.
+            _style = [f for f in _findings if f.get("action_kind") == "format"]
+            _findings = [f for f in _findings if f.get("action_kind") != "format"]
+            if _style:
+                print(f"[Lint] {len(_style)} style findings "
+                      f"({', '.join(sorted({f['symbol'] for f in _style}))}) "
+                      f"— autopep8 will fix these at the end, no questions.")
+
             for _f in _findings[:_cap]:
+                if _f["symbol"] in _done_kinds:      # ignored mid-run
+                    _ignored += 1
+                    continue
                 _lines = _path.read_text(encoding="utf-8").splitlines(keepends=True)
                 if _f["line"] > len(_lines):
                     continue
                 _old = _lines[_f["line"] - 1].rstrip("\n")
-                print(f"\n{ASSISTANT_COLOR}[{_f['symbol']}]{RESET_COLOR} "
-                      f"line {_f['line']}: {_f['message']}")
-                print(f"  - {_old}")
-                _new = _propose_fix(model, cfg, layers_ref, _lines, _f)
-                if not _new or _new == "UNFIXABLE":
-                    print("  (model could not fix this one)")
+                _kind0 = _f.get("action_kind", "line")
+                if _kind0 == "line" and not _old.strip():
+                    # Rewriting a blank line has no meaning, and an empty old_str
+                    # is what used to wipe the file.
+                    print(f"\n{ASSISTANT_COLOR}[{_f['symbol']}]{RESET_COLOR} "
+                          f"line {_f['line']}: blank line — nothing to rewrite, skipped")
                     _skipped += 1
                     continue
-                print(f"  + {_new}")
-                try:
-                    _ans = input("  [f]ix / [s]kip / [d]efer / [q]uit: ").strip().lower()
-                except (EOFError, KeyboardInterrupt):
-                    print()
+                _same = sum(1 for x in _findings if x["symbol"] == _f["symbol"])
+                print(f"\n{ASSISTANT_COLOR}[{_f['symbol']}]{RESET_COLOR} "
+                      f"line {_f['line']}"
+                      + (f"   ({_same} of this kind)" if _same > 1 else ""))
+                _kind = _f.get("action_kind", "line")
+                print(f"  meaning: {_f.get('meaning') or _f['message']}")
+                print(f"  action : {_f.get('action', 'rewrite the line')}")
+                if _f.get("note"):
+                    print(f"  note   : {_f['note']}")
+
+                # action_kind decides HOW to fix, never whether to offer one.
+                # Asking for a line rewrite regardless is how a rename finding
+                # turned into a shebang edit.
+                _new = ""
+                if _kind.startswith(("reindent", "line", "insert")):
+                    _new = _propose_or_compute(model, cfg, layers_ref, _lines, _f)
+                    if not _new:
+                        print("  (no fix could be produced)")
+                    elif _kind.startswith("reindent"):
+                        print(f"  - {_old}")
+                        print(f"  + {_new}   (computed, no model)")
+                    elif _kind == "line":
+                        print(f"  - {_old}")
+                        print(f"  + {_new}")
+                    else:
+                        print(f"  + {_new}   (inserted, nothing overwritten)")
+                elif _kind == "rename":
+                    _new = str(_path.with_name(
+                        _path.stem.replace("-", "_").lower() + _path.suffix))
+                    print(f"  + {_path.name} -> {Path(_new).name}")
+
+                _choices = ("  [f]ix / [s]kip / [i]gnore kind / [d]efer / [r]aw / [q]uit: "
+                            if _new else
+                            "  [s]kip / [i]gnore kind / [d]efer / [r]aw / [q]uit: ")
+                while True:
+                    try:
+                        _ans = input(_choices).strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        _ans = "q"
+                    if _ans.startswith("r"):
+                        print(f"  pylint : {_f.get('raw') or _f['message']}")
+                        continue          # re-prompt, decision still pending
                     break
+
                 if _ans.startswith("q"):
                     break
-                if _ans.startswith("f"):
-                    _r = edit_file_tool(str(_path), _old, _new)
-                    print(f"  {_summarise_result('edit_file', _r)}")
+                if _new and _ans.startswith("f"):
+                    if _kind != "rename":
+                        _r = _apply_fix(_path, _lines, _f, _new)
+                        print(f"  {_summarise_result('write_file', _r)}")
+                    elif _kind == "rename":
+                        _dest = Path(_new)
+                        if not _writable(_path) or not _writable(_dest):
+                            print(f"  {_write_denied(_dest)['hint']}")
+                        elif _dest.exists():
+                            print(f"  {_dest.name} already exists — not renaming.")
+                        else:
+                            _path.rename(_dest)
+                            print(f"  renamed -> {_dest}")
+                            _path = _dest
                     _fixed += 1
+                elif _ans.startswith("i"):
+                    # "this doesn't matter" — drop the rest of this kind for the
+                    # rest of the run. Nothing is written anywhere.
+                    _done_kinds.add(_f["symbol"])
+                    print(f"  ignoring {_f['symbol']} for this run"
+                          f"{f' ({_same} findings)' if _same > 1 else ''}")
+                    _ignored += 1
                 elif _ans.startswith("d"):
                     _defer(_target, _f)
                     print(f"  deferred -> {DEBT_FILE}")
                     _deferred += 1
                 else:
                     _skipped += 1
-            print(f"\n[Fix] {_fixed} fixed, {_skipped} skipped, {_deferred} deferred.")
+            # After the model edits, not before: autopep8 also repairs the
+            # indentation of anything the model inserted.
+            if _style and "format_file" in TOOL_REGISTRY:
+                _fr = TOOL_REGISTRY["format_file"](filename=str(_path))
+                if "error" in _fr:
+                    print(f"\n[Lint] autopep8: {_fr['error']}")
+                else:
+                    print(f"\n[Lint] autopep8 fixed {len(_style)} style findings "
+                          f"({_fr.get('changed', 0)} lines changed, no model used).")
+                    _fixed += len(_style)
+
+            print(f"\n[Lint] {_fixed} fixed, {_skipped} skipped, "
+                  f"{_ignored} ignored, {_deferred} deferred.")
+            if not _finish_run(_path, _snapshot):
+                print(f"{ASSISTANT_COLOR}[Lint]{RESET_COLOR} The result no longer "
+                      f"compiles — all changes reverted. {_path.name} is as it was.")
             continue
 
         # Any registered tool is callable as /name — including plugins dropped

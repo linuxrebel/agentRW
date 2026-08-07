@@ -309,9 +309,10 @@ def test_native_tool_calls_are_read():
     assert ca.extract_tools(ca._reply_text(msg)) == [
         ("list_files", {"path": "/home/james/bin"})]
 
+    # Core tools only — plugin tools are optional and may not be installed.
     multi = types.SimpleNamespace(content=None, tool_calls=[
         call("read_file", '{"filename":"a.py"}'),
-        call("lint_file", '{"filename":"a.py"}')])
+        call("search_file", '{"filename":"a.py","text":"x"}')])
     assert len(ca.extract_tools(ca._reply_text(multi))) == 2
 
     # plain text replies unaffected
@@ -353,8 +354,8 @@ def test_json_tool_call_format():
          [("read_file", {"filename": "/x/y.py"})]),
         ('{"name":"run_command","arguments":{"cmd":"ls -la"}}',
          [("run_command", {"cmd": "ls -la"})]),
-        ('I will do this:\n{"name": "lint_file", "arguments": {"filename": "a.py"}}\nok',
-         [("lint_file", {"filename": "a.py"})]),
+        ('I will do this:\n{"name": "list_files", "arguments": {"path": "."}}\nok',
+         [("list_files", {"path": "."})]),
         ('{"name":"read_file","arguments":"{\\"filename\\":\\"a.py\\"}"}',
          [("read_file", {"filename": "a.py"})]),
         ('```json\n{"name":"read_file","arguments":{"filename":"a.py"}}\n```',

@@ -14,17 +14,29 @@ you're driving Claude or GPT through an API.
 scarce resource is not model capability but the context window. Every design choice
 follows from that:
 
-- The system prompt is **539 tokens** — 26% of a 2048-token window, measured and
-  trimmed rather than guessed at.
+- The system prompt is **593 tokens**, or **539 under `--low-vram`** — 28% and
+  26% of a 2048-token window. Measured and trimmed rather than guessed at.
+
 - Shell commands run *directly*, never through the model. Typing `ls` or `git status`
   costs zero tokens.
-- Tools return summaries, not dumps.
-- One file, ~1030 lines, standard library plus the `openai` client.
+- Tools return summaries, not dumps. Raw pylint output on a 1000-line file is
+  ~2400 tokens; the same findings grouped are ~150.
+- **Deterministic work goes to real tools.** `/lint` sends 5 findings to a model
+  and hands the other 11 to autopep8 — one subprocess, no tokens, and it cannot
+  alter the code either side of the whitespace.
+- A tool costs nothing to *have*, only to *advertise*. Anything the model does
+  not need to call itself stays out of the prompt and remains callable.
 
 It is a **harness, not a critic**: it writes what the model produces and leaves
 judging the result to you. An earlier version validated content before writing and
 that turned out to be the single biggest source of apparent "bad model output" —
 see `CLAUDE.md`.
+
+Measured on a 35-line file with six models, from a pylint baseline of 2.61:
+gemma4:31b-cloud 9.57, qwen2.5-coder:7b 9.13, ornith:latest 8.26, and 7.39 for
+qwen3.5, qwen3.6 and ornith:35b. **All six improve the file; none break it.**
+The 7.39 floor is autopep8 alone — a model that contributes nothing costs you
+time, not correctness.
 
 Runs fully local against [Ollama](https://ollama.com), so nothing leaves your
 machine unless you point it at a cloud model on purpose.
@@ -45,6 +57,13 @@ pip install -r requirements.txt
 ```
 
 `prompt_toolkit` is optional (Alt+Enter multi-line input); the agent falls back to plain `input()` without it. `colorama` installs on Windows only.
+
+`pylint` and `autopep8` power the bundled plugins. They are also distro packages
+(Fedora `python3-pylint` / `python3-autopep8`, Debian `pylint` /
+`python3-autopep8`) and the plugins invoke them as executables on `PATH`, so
+either source works. Prefer the distro package or a venv — pip on top of a
+distro copy is a known way to break a system Python. Without them the plugins
+stay dormant and say so; nothing else is affected.
 
 ---
 
@@ -136,7 +155,7 @@ listing and makes no API calls.
 
 **`ollama pull` proves nothing.** It fetches a manifest, and the subscription is
 only checked at inference time, so a pull of a model you cannot use still
-succeeds. Use `/cloud-models check`, not a successful pull.
+succeeds. Use `/cloud-models`, not a successful pull.
 
 **Your code leaves your machine.** Everything else in this README describes a
 fully local setup; a `:cloud` tag sends file contents and commands to Ollama's
@@ -190,6 +209,64 @@ The model calls these itself:
 | `search_file` | Case-insensitive grep |
 | `list_files` | Directory listing |
 | `run_command` | Run a shell command as the current user (no sudo) |
+
+Every tool is also callable directly — `/read_file foo.py start_line=50` — and
+`/tools` shows which are advertised to the model and what each costs.
+
+---
+
+## Plugins
+
+Drop a `.py` file into `tools/`. It is discovered — no registration, no manifest,
+no code changes. Two naming conventions are the whole API:
+
+| suffix | becomes |
+|---|---|
+| `*_tool` | a tool the model can call, and `/name` |
+| `*_command` | a slash command `/name` |
+
+A plugin gates itself on what it needs, in ordinary Python:
+
+```python
+if shutil.which("pylint"):
+    def lint_command(ctx, args): ...
+```
+
+Miss the requirement and the command is never registered — **absent, not
+broken**. It does not appear in `/help` and `/lint` falls through to the model
+like any unknown word. `/plugins` shows what is registered and what is dormant.
+
+**Commands are free; tools are not.** A command costs nothing until you invoke
+it. A tool's docstring rides in the system prompt, which is re-sent with *every*
+request — so an advertised tool costs its tokens every turn, used or not.
+Loading is irrelevant: a plugin loads in 0.2 ms.
+
+Dispatch and advertisement are separate, so a tool can be callable without being
+advertised:
+
+```
+/tools                    what is advertised, and the cost of each
+/tools off lint_file      drop from the prompt, still callable as /lint_file
+/tools core               core six only
+```
+
+`--low-vram` does the last one automatically. `/lint` reaches the same 9.13
+whether or not `lint_file` is advertised, because the plugin calls it directly.
+
+Two plugins ship with the agent:
+
+| plugin | provides | needs |
+|---|---|---|
+| `tools/lint.py` | `lint_file`, `/lint` | pylint |
+| `tools/format.py` | `format_file` | autopep8 |
+
+**`/lint <file>`** walks pylint findings one at a time — fix, skip, ignore the
+whole kind, defer to `DEBT.md`, or see the raw message. It explains what each
+finding means in plain English, hands every style finding to autopep8 without
+asking, and reverts the entire run if the result no longer compiles.
+
+Writing one: see [PLUGINS.md](PLUGINS.md) — conventions, the `ctx` API, the four
+contract obligations, and the trust model.
 
 ---
 

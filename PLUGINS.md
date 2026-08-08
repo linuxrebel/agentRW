@@ -87,7 +87,7 @@ short — it is paid for on every single turn.
 
 ## The contract
 
-Four obligations. A plugin that does not meet them is a bug, not a variation.
+Five obligations. A plugin that does not meet them is a bug, not a variation.
 
 ### 1. Declare what you need
 
@@ -140,9 +140,42 @@ def lint_command(ctx, args: str) -> None:
 
 `/lint help` is how someone discovers a plugin they did not write.
 
----
+### 5. Say what you touch, in your README
 
-## ctx — the plugin API
+Installing your plugin means running your code. The convention elsewhere is to
+tell users to read the source first — which nobody does, and which quietly
+moves the blame onto them for not doing it.
+
+Write a **What this will do** section instead. Two lists, plain language,
+checkable against your code by anyone who cares to:
+
+```markdown
+## What this will do
+
+**It will:**
+- Read and rewrite the .py file you point /lint at, one line at a time, and
+  only after you approve each change
+- Write a .bak beside that file before the first change
+- Append to DEBT.md in your working directory when you answer `defer`
+- Run pylint and autopep8 as subprocesses
+- Send short snippets to whichever model agentRW is pointed at. If that is a
+  cloud model, those lines leave the machine
+
+**It will not:**
+- Touch any file except the one you named
+- Apply anything the user has not seen and agreed to
+- Install packages, change configuration, or reach the network itself
+```
+
+Be specific about three things in particular, because they are what someone
+would actually want to know and cannot infer:
+
+- **what you write**, and whether the original is recoverable
+- **what leaves the machine**, especially anything sent to a model
+- **what you run**, if you shell out
+
+A user who cannot read Python can still decide from that. A user who can read
+Python now knows what to check.
 
 Your command receives `ctx`. **Use only what is listed here.** The harness
 renames and restructures its internals freely; `ctx` is the contract that does
@@ -266,8 +299,11 @@ What the harness does limit:
   limit the model has, so a plugin using it cannot wander.
 
 Taken together these prevent accidents and make hostile behaviour conspicuous.
-They do not stop a determined author. Read a plugin before you install it — the
-whole point of the design is that a plugin is one readable file.
+They do not stop a determined author.
+
+The usual advice here is "read the source before you install it". Nobody reads
+four hundred lines of someone else's Python, and pretending otherwise just
+moves the blame onto the user. See obligation 5.
 
 ---
 

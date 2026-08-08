@@ -35,8 +35,8 @@ if ! command -v ollama >/dev/null; then
 fi
 
 command -v python3 >/dev/null || { echo "python3 not found on PATH." >&2; exit 1; }
-python3 - <<'PY' || { echo "agentRW needs Python 3.10 or newer." >&2; exit 1; }
-import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)
+python3 - <<'PY' || { echo "agentRW needs Python 3.9 or newer." >&2; exit 1; }
+import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)
 PY
 
 # Preserve plugins across an upgrade: tools/ is where installed plugins live.
@@ -68,7 +68,9 @@ ln -sfn "$PREFIX/coding_agent.py" "$LINK"
 echo "Linked $LINK -> $PREFIX/coding_agent.py"
 
 echo
-echo "Installed. Run:  cagent"
+echo "  ============================================================"
+echo "   Install successful.  Run 'cagent' to start the harness."
+echo "  ============================================================"
 echo
 echo "Python packages (as your normal user, not root):"
 echo "    pip install --user -r $PREFIX/requirements.txt"

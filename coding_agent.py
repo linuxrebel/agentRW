@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-# Requires Python 3.10+ (uses `int | None` annotations)
+# Requires Python 3.9+  (macOS ships 3.9.6 as the system Python)
 
 import sys
 
-if sys.version_info < (3, 10):
-    sys.exit(f"coding_agent.py needs Python 3.10+, found {sys.version.split()[0]}")
+if sys.version_info < (3, 9):
+    sys.exit(f"coding_agent.py needs Python 3.9+, found {sys.version.split()[0]}")
 
 import ast
 import concurrent.futures
@@ -19,7 +19,7 @@ import types
 import threading
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI, APIConnectionError, BadRequestError, InternalServerError, APIStatusError
 
@@ -288,7 +288,7 @@ def edit_file_tool(path: str, old_str: str, new_str: str) -> Dict[str, Any]:
 MAX_CAPTURE_BYTES = 1_000_000  # per stream, before the command is killed
 
 
-def _run_capped(cmd: str, timeout: int, cwd: str | None = None,
+def _run_capped(cmd: str, timeout: int, cwd: Optional[str] = None,
                 cap: int = MAX_CAPTURE_BYTES) -> Tuple[str, str, int, bool]:
     """Run a shell command, never buffering more than `cap` bytes per stream.
 
@@ -911,8 +911,8 @@ def _reply_text(msg) -> str:
     return msg.content or ""
 
 
-def call_llm(model: str, messages: list, gpu_layers: "list[int | None]" = None,
-             max_tokens: int = 2000, num_ctx: int | None = None,
+def call_llm(model: str, messages: list, gpu_layers: "Optional[List[Optional[int]]]" = None,
+             max_tokens: int = 2000, num_ctx: Optional[int] = None,
              token_budget: int = TOKEN_BUDGET, send_tools: bool = True) -> str:
     budget = token_budget
     trimmed = proactive_trim(messages, budget_tokens=budget)
@@ -1361,8 +1361,8 @@ def _summarise_result(tool_name: str, result: dict) -> str:
 # -----------------------------
 # Main loop
 # -----------------------------
-def run(model: str, gpu_layers: int | None = None,
-        max_tokens: int = 2000, num_ctx: int | None = None,
+def run(model: str, gpu_layers: Optional[int] = None,
+        max_tokens: int = 2000, num_ctx: Optional[int] = None,
         token_budget: int = TOKEN_BUDGET):
     layers_ref = [gpu_layers]  # mutable so call_llm can update it on OOM
     cfg = {"max_tokens": max_tokens, "num_ctx": num_ctx, "token_budget": token_budget}
@@ -1884,7 +1884,7 @@ def _flags_to_str(flags: dict) -> str:
     return " ".join(parts)
 
 
-def _resolve_model(passed: str | None, cli_flags: dict) -> tuple:
+def _resolve_model(passed: Optional[str], cli_flags: dict) -> tuple:
     """Returns (model, effective_flags_dict)."""
     cfg = _load_config()
     saved = cfg.get("default")  # {"model": "...", "low_vram": ..., ...}

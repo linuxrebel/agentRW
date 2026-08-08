@@ -35,12 +35,12 @@ if errorlevel 1 (
 
 where python >nul 2>&1
 if errorlevel 1 (
-    echo python not found on PATH. Install Python 3.10 or newer.
+    echo python not found on PATH. Install Python 3.9 or newer.
     exit /b 1
 )
-python -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)"
+python -c "import sys; sys.exit(0 if sys.version_info >= (3,9) else 1)"
 if errorlevel 1 (
-    echo agentRW needs Python 3.10 or newer.
+    echo agentRW needs Python 3.9 or newer.
     exit /b 1
 )
 
@@ -86,8 +86,12 @@ powershell -NoProfile -Command ^
   "} else { Write-Host '%PREFIX% already on your PATH' }"
 
 echo.
-echo Installed. Open a NEW terminal, then run:  cagent
-echo   ^(PATH changes do not reach terminals that are already open^)
+echo   ============================================================
+echo    Install successful.  Run 'cagent' to start the harness.
+echo.
+echo    Open a NEW terminal first - PATH changes do not reach
+echo    terminals that are already running.
+echo   ============================================================
 echo.
 echo Python packages:
 echo     pip install --user -r "%PREFIX%\requirements.txt"

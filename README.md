@@ -48,7 +48,7 @@ constraint — use OpenCode or Claude Code, which do far more with that budget.
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.9+ (macOS system Python works)
 - Ollama installed and running — see [ollama.com/download](https://ollama.com/download)
 - At least one model pulled — browse [ollama.com/library](https://ollama.com/library?sort=newest)
 

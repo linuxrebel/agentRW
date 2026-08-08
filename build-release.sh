@@ -34,6 +34,20 @@ TARBALL="$OUT/${NAME}.tar.gz"
 tar -czf "$TARBALL" -C "$STAGE" "$NAME"
 rm -rf "$STAGE"
 
+# Keep the three most recent releases and drop the rest.
+#
+# Three because that is enough to bisect a regression a user reports and to
+# roll someone back one version while you fix it — and few enough that nobody
+# grabs a stale tarball by accident. Older ones are recoverable: the tag is in
+# git, so `git checkout v1.2.5 && ./build-release.sh` rebuilds any of them.
+KEEP_RELEASES=3
+# shellcheck disable=SC2012
+ls -1 "$OUT"/agentRW-*.tar.gz 2>/dev/null | sort -V | head -n -"$KEEP_RELEASES" | \
+while read -r old; do
+    echo "pruning $(basename "$old")"
+    rm -f "$old"
+done
+
 echo "$TARBALL"
 tar -tzf "$TARBALL" | sed 's/^/  /'
 echo

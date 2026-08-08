@@ -37,7 +37,11 @@ rm -rf "$STAGE"
 echo "$TARBALL"
 tar -tzf "$TARBALL" | sed 's/^/  /'
 echo
-echo "sha256: $(sha256sum "$TARBALL" | cut -d' ' -f1)"
+if command -v sha256sum >/dev/null; then
+    echo "sha256: $(sha256sum "$TARBALL" | cut -d" " -f1)"
+else
+    echo "sha256: $(shasum -a 256 "$TARBALL" | cut -d" " -f1)"   # macOS
+fi
 echo
 echo "Install (Linux/macOS, system-wide):"
 echo "  tar -xzf $TARBALL"

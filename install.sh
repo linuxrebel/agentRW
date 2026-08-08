@@ -16,6 +16,24 @@ for f in coding_agent.py requirements.txt; do
     [ -f "$HERE/$f" ] || { echo "Missing $f — run this from the unpacked release." >&2; exit 1; }
 done
 
+# Ollama is what agentRW talks to. Nothing works without it, so stop here
+# rather than install something that cannot run. Their installer, not ours.
+if ! command -v ollama >/dev/null; then
+    echo
+    echo "  Ollama was not found on this machine."
+    echo
+    echo "  agentRW talks to a model through Ollama, so it needs to be installed"
+    echo "  first. Get it from:"
+    echo
+    echo "      https://ollama.com"
+    echo
+    echo "  Install it their way, then run this again."
+    echo
+    read -n 1 -s -r -p "  Press any key to exit."
+    echo
+    exit 1
+fi
+
 command -v python3 >/dev/null || { echo "python3 not found on PATH." >&2; exit 1; }
 python3 - <<'PY' || { echo "agentRW needs Python 3.10 or newer." >&2; exit 1; }
 import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)

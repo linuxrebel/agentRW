@@ -15,6 +15,24 @@ if not exist "%HERE%\coding_agent.py" (
     exit /b 1
 )
 
+rem Ollama is what agentRW talks to. Nothing works without it, so stop here
+rem rather than install something that cannot run. Their installer, not ours.
+where ollama >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo   Ollama was not found on this machine.
+    echo.
+    echo   agentRW talks to a model through Ollama, so it needs to be installed
+    echo   first. Get it from:
+    echo.
+    echo       https://ollama.com
+    echo.
+    echo   Install it their way, then run this again.
+    echo.
+    pause
+    exit /b 1
+)
+
 where python >nul 2>&1
 if errorlevel 1 (
     echo python not found on PATH. Install Python 3.10 or newer.

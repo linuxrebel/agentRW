@@ -96,8 +96,10 @@ echo.
 echo Python packages:
 echo     pip install --user -r "%PREFIX%\requirements.txt"
 echo.
-echo For the lint plugin:
-echo     pip install --user pylint autopep8
+echo Only if you work on Python - the bundled formatting plugin wants autopep8:
+echo     python -m pip install --user autopep8
+echo.
+echo Nothing else is needed. Plugins say so themselves in /plugins.
 echo.
 echo Uninstall with:  "%PREFIX%\uninstall.bat"
 endlocal

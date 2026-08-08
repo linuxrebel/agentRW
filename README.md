@@ -58,12 +58,24 @@ pip install -r requirements.txt
 
 `prompt_toolkit` is optional (Alt+Enter multi-line input); the agent falls back to plain `input()` without it. `colorama` installs on Windows only.
 
-`pylint` and `autopep8` power the bundled plugins. They are also distro packages
-(Fedora `python3-pylint` / `python3-autopep8`, Debian `pylint` /
-`python3-autopep8`) and the plugins invoke them as executables on `PATH`, so
-either source works. Prefer the distro package or a venv — pip on top of a
-distro copy is a known way to break a system Python. Without them the plugins
-stay dormant and say so; nothing else is affected.
+That is the whole list. **agentRW is not a Python-only tool** — it edits and
+runs whatever you point it at, and nothing beyond the above is needed to use it
+for Go, Rust, shell or anything else.
+
+Plugins declare their own requirements and stay dormant, with a clear message
+in `/plugins`, when those are missing. Nothing else is affected. The bundled
+`linuxrebel/format` plugin wants `autopep8`, and is worth installing only if
+you work on Python:
+
+```bash
+sudo dnf install python3-autopep8      # Fedora
+sudo apt install python3-autopep8      # Debian, Ubuntu
+python3 -m pip install --user autopep8 # anywhere
+```
+
+Prefer the distro package — pip on top of a distro Python is a known way to
+break it. The plugin invokes `autopep8` as an executable on `PATH`, so either
+source works.
 
 ---
 
@@ -90,9 +102,11 @@ Needs root, because it writes to `/opt` and `/usr/local/bin`. Run it without
 
 ### Windows — per-user, no admin
 
-```
+In **PowerShell**:
+
+```powershell
 tar -xzf agentRW-1.2.7.tar.gz
-agentRW-1.2.7\install.bat
+.\agentRW-1.2.7\install.bat
 ```
 
 Installs under `%LOCALAPPDATA%`, so no administrator rights are needed.
@@ -106,7 +120,7 @@ program directory to your user `PATH`, and Windows only reads `PATH` when a
 shell starts — so `cagent` will not be recognised in the session you installed
 from, no matter what you do to it. Close it, open a new one, then run `cagent`.
 
-The same applies to cmd and Windows Terminal tabs that were already open.
+The same applies to any Windows Terminal tab that was already open.
 
 ### What gets installed, and where
 
@@ -149,9 +163,16 @@ cagent --help               # every flag
 
 ### Uninstalling
 
+Linux and macOS:
+
 ```bash
-sudo /opt/agentRW/uninstall.sh              # Linux / macOS
-%LOCALAPPDATA%\Programs\agentRW\uninstall.bat   # Windows
+sudo /opt/agentRW/uninstall.sh
+```
+
+Windows, in PowerShell:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\agentRW\uninstall.bat"
 ```
 
 Both list any installed plugins by name before asking, since removing the

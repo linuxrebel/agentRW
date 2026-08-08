@@ -111,8 +111,9 @@ echo
 echo "Python packages (as your normal user, not root):"
 echo "    pip install --user -r $PREFIX/requirements.txt"
 echo
-echo "pylint and autopep8 are better from your distro:"
-echo "    Fedora  sudo dnf install python3-pylint python3-autopep8"
-echo "    Debian  sudo apt install pylint python3-autopep8"
+echo "Only if you work on Python: the bundled formatting plugin wants autopep8."
+echo "    Fedora  sudo dnf install python3-autopep8"
+echo "    Debian  sudo apt install python3-autopep8"
+echo "Nothing else is needed. Plugins say so themselves in /plugins."
 echo
 echo "Uninstall with:  sudo $PREFIX/uninstall.sh"

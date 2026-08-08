@@ -74,6 +74,11 @@ chmod 755 "$PREFIX/coding_agent.py"
 # Pinning the interpreter the installer actually verified removes the guesswork
 # on every platform.
 PYBIN="$(python3 -c 'import sys; print(sys.executable)')"
+# Break any existing launcher first. An upgrade over the old symlink-based
+# install leaves $LINK as a symlink INTO $PREFIX/coding_agent.py; `cat >` would
+# follow it and overwrite the program with this launcher text. rm the link so we
+# write a fresh regular file instead of through the old one.
+rm -f "$LINK"
 cat > "$LINK" <<EOF
 #!/bin/sh
 # agentRW launcher. Interpreter pinned at install time.

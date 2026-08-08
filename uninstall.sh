@@ -11,7 +11,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-if [ ! -d "$PREFIX" ] && [ ! -L "$LINK" ]; then
+if [ ! -d "$PREFIX" ] && [ ! -e "$LINK" ]; then
     echo "agentRW is not installed at $PREFIX."
     exit 0
 fi
@@ -33,7 +33,9 @@ case "$ans" in
     *) echo "Nothing removed."; exit 0 ;;
 esac
 
-if [ -L "$LINK" ]; then
+# -e not -L: the launcher is a small shell script now, not a symlink, because
+# shebang resolution is not dependable on macOS.
+if [ -e "$LINK" ]; then
     rm -f "$LINK"
     echo "Removed $LINK"
 fi

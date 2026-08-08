@@ -64,8 +64,39 @@ fi
 chmod 755 "$PREFIX/coding_agent.py"
 [ -f "$PREFIX/uninstall.sh" ] && chmod 755 "$PREFIX/uninstall.sh"
 
-ln -sfn "$PREFIX/coding_agent.py" "$LINK"
-echo "Linked $LINK -> $PREFIX/coding_agent.py"
+# A launcher script, not a symlink to the .py.
+#
+# `#!/usr/bin/env python3` is not reliable on macOS: /usr/bin/python3 is a stub
+# that resolves differently under shebang execution than from a shell, so
+# `python3 coding_agent.py` worked while `./coding_agent.py` could not import
+# openai — same machine, one interpreter on PATH, different sys.path.
+#
+# Pinning the interpreter the installer actually verified removes the guesswork
+# on every platform.
+PYBIN="$(python3 -c 'import sys; print(sys.executable)')"
+cat > "$LINK" <<EOF
+#!/bin/sh
+# agentRW launcher. Interpreter pinned at install time.
+exec "$PYBIN" "$PREFIX/coding_agent.py" "\$@"
+EOF
+chmod 755 "$LINK"
+echo "Launcher $LINK -> $PYBIN $PREFIX/coding_agent.py"
+
+# Check as the invoking user, not root: a --user install lives in their home,
+# so importing as root would report a missing package that is actually there.
+RUNAS="${SUDO_USER:-$(id -un)}"
+if ! sudo -u "$RUNAS" "$PYBIN" -c "import openai" >/dev/null 2>&1; then
+    echo
+    echo "  ============================================================"
+    echo "   Installed, but cagent will NOT start yet."
+    echo
+    echo "   The 'openai' package is missing. Run as yourself, not root:"
+    echo
+    echo "       $PYBIN -m pip install --user -r $PREFIX/requirements.txt"
+    echo "  ============================================================"
+    echo
+    exit 0
+fi
 
 echo
 echo "  ============================================================"

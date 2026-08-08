@@ -14,16 +14,17 @@ you're driving Claude or GPT through an API.
 scarce resource is not model capability but the context window. Every design choice
 follows from that:
 
-- The system prompt is **593 tokens**, or **539 under `--low-vram`** — 28% and
-  26% of a 2048-token window. Measured and trimmed rather than guessed at.
+- The system prompt is **539 tokens** — 26% of a 2048-token window, measured and
+  trimmed rather than guessed at. Each plugin tool you add costs ~40 more, on
+  every turn, unless you leave it unadvertised.
 
 - Shell commands run *directly*, never through the model. Typing `ls` or `git status`
   costs zero tokens.
 - Tools return summaries, not dumps. Raw pylint output on a 1000-line file is
   ~2400 tokens; the same findings grouped are ~150.
-- **Deterministic work goes to real tools.** `/lint` sends 5 findings to a model
-  and hands the other 11 to autopep8 — one subprocess, no tokens, and it cannot
-  alter the code either side of the whitespace.
+- **Deterministic work goes to real tools.** The lint plugin sends 5 findings to
+  a model and hands the other 11 to autopep8 — one subprocess, no tokens, and it
+  cannot alter the code either side of the whitespace.
 - A tool costs nothing to *have*, only to *advertise*. Anything the model does
   not need to call itself stays out of the prompt and remains callable.
 
@@ -93,8 +94,8 @@ Build a release tarball from a checkout:
 ### Linux / macOS — system-wide
 
 ```bash
-tar -xzf agentRW-1.2.7.tar.gz
-sudo ./agentRW-1.2.7/install.sh
+tar -xzf agentRW-1.2.8.tar.gz
+sudo ./agentRW-1.2.8/install.sh
 ```
 
 Needs root, because it writes to `/opt` and `/usr/local/bin`. Run it without
@@ -105,8 +106,8 @@ Needs root, because it writes to `/opt` and `/usr/local/bin`. Run it without
 In **PowerShell**:
 
 ```powershell
-tar -xzf agentRW-1.2.7.tar.gz
-.\agentRW-1.2.7\install.bat
+tar -xzf agentRW-1.2.8.tar.gz
+.\agentRW-1.2.8\install.bat
 ```
 
 Installs under `%LOCALAPPDATA%`, so no administrator rights are needed.
@@ -127,7 +128,7 @@ The same applies to any Windows Terminal tab that was already open.
 | | Linux / macOS | Windows |
 |---|---|---|
 | program | `/opt/agentRW/` | `%LOCALAPPDATA%\Programs\agentRW\` |
-| launcher | symlink `/usr/local/bin/cagent` | `cagent.bat` in the install dir, added to your user `PATH` |
+| launcher | `/usr/local/bin/cagent`, a script pinned to the Python found at install time | `cagent.bat` in the install dir, added to your user `PATH` |
 | plugins | `/opt/agentRW/tools/` | `…\agentRW\tools\` |
 | your config | `~/.config/coding_agent/` | `%APPDATA%\coding_agent\` |
 | privilege | root | none |
@@ -135,8 +136,10 @@ The same applies to any Windows Terminal tab that was already open.
 The install directory holds `coding_agent.py`, `requirements.txt`, the docs,
 `tools/`, and the uninstaller. Nothing is written anywhere else.
 
-On Windows the launcher is a `.bat` shim rather than a symlink — symlinks need
-admin or developer mode. Because it is on `PATH`, `cagent` works from
+Neither launcher is a symlink. On Unix `#!/usr/bin/env python3` is not
+dependable — on macOS `/usr/bin/python3` is a dispatcher stub that resolves
+differently under shebang execution, so the launcher pins the interpreter the
+installer verified. On Windows symlinks need admin or developer mode. Because it is on `PATH`, `cagent` works from
 PowerShell, cmd and Windows Terminal alike; no `$PROFILE` alias is added and
 your profile is not touched.
 
@@ -157,7 +160,7 @@ pip install --user -r /opt/agentRW/requirements.txt
 ```bash
 cagent                      # your saved default model
 cagent qwen2.5-coder:7b     # a specific model, saved as default on first use
-cagent --low-vram           # 4 GB preset, trims the prompt to 539 tokens
+cagent --low-vram           # 4 GB preset; also stops advertising plugin tools
 cagent --help               # every flag
 ```
 
@@ -186,17 +189,17 @@ left alone.
 Run without a model name and it will ask for one:
 
 ```
-$ coding_agent
+$ cagent
 First run: please provide a model name and any arguments. Run --help for options.
 ```
 
 Pass a model — it gets saved as your default:
 
 ```bash
-coding_agent <model-name> --low-vram
+cagent <model-name> --low-vram
 ```
 
-After that, `coding_agent` alone uses the saved default. Passing a different model prompts you to update it.
+After that, `cagent` alone uses the saved default. Passing a different model prompts you to update it.
 
 ---
 
@@ -219,7 +222,7 @@ until it times out. It is one-time machine setup, not a session command.
 Then just use one. **No pull needed** — cloud models resolve server-side:
 
 ```bash
-coding_agent gpt-oss:20b-cloud
+cagent gpt-oss:20b-cloud
 ```
 
 `/model gpt-oss:20b-cloud` also works mid-session.
@@ -263,7 +266,7 @@ top of `coding_agent.py` and would need editing.
 coding_agent.py [MODEL] [OPTIONS]
 ```
 
-Run `coding_agent --help` for the full flag reference, and `/help` inside a session for the slash-command list. Both print from the source, so they never drift.
+Run `cagent --help` for the full flag reference, and `/help` inside a session for the slash-command list. Both print from the source, so they never drift.
 
 ---
 
@@ -342,22 +345,31 @@ advertised:
 /tools core               core six only
 ```
 
-`--low-vram` does the last one automatically. `/lint` reaches the same 9.13
-whether or not `lint_file` is advertised, because the plugin calls it directly.
+`--low-vram` does the last one automatically. A plugin's command still works
+whether or not its tool is advertised, because the plugin calls it directly.
 
-Two plugins ship with the agent:
+One plugin ships with the agent:
 
 | plugin | provides | needs |
 |---|---|---|
-| `linuxrebel/lint` | `lint_file`, `/lint` | pylint, autopep8 |
 | `linuxrebel/format` | `format_file` | autopep8 |
+
+It is not advertised to the model — nothing calls it but other plugins and you,
+so it costs no tokens.
+
+### Available separately
+
+| plugin | provides | where |
+|---|---|---|
+| `linuxrebel/lint` | `lint_file`, `/lint` | [arwLint](https://github.com/linuxrebel/arwLint) |
 
 **`/lint <file>`** walks pylint findings one at a time — fix, skip, ignore the
 whole kind, defer to `DEBT.md`, or see the raw message. It explains what each
 finding means in plain English, hands every style finding to autopep8 without
-asking, and reverts the entire run if the result no longer compiles.
+asking, and reverts the entire run if the result no longer compiles. Install
+instructions are in its own README.
 
-Writing one: see [PLUGINS.md](PLUGINS.md) — conventions, the `ctx` API, the four
+Writing one: see [PLUGINS.md](PLUGINS.md) — conventions, the `ctx` API, the five
 contract obligations, and the trust model.
 
 ---

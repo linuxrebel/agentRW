@@ -81,8 +81,8 @@ Build a release tarball from a checkout:
 ### Linux / macOS — system-wide
 
 ```bash
-tar -xzf agentRW-1.2.6.tar.gz
-sudo ./agentRW-1.2.6/install.sh
+tar -xzf agentRW-1.2.7.tar.gz
+sudo ./agentRW-1.2.7/install.sh
 ```
 
 Needs root, because it writes to `/opt` and `/usr/local/bin`. Run it without
@@ -91,8 +91,8 @@ Needs root, because it writes to `/opt` and `/usr/local/bin`. Run it without
 ### Windows — per-user, no admin
 
 ```
-tar -xzf agentRW-1.2.6.tar.gz
-agentRW-1.2.6\install.bat
+tar -xzf agentRW-1.2.7.tar.gz
+agentRW-1.2.7\install.bat
 ```
 
 Installs under `%LOCALAPPDATA%`, so no administrator rights are needed.
@@ -101,8 +101,12 @@ Deliberately *not* `Program Files`: that needs admin **and** a system `PATH`
 edit, and `setx /M` silently truncates `PATH` at 1024 characters. Per-user is
 what VS Code and most developer CLIs do on Windows.
 
-**Open a new terminal afterwards** — `PATH` changes do not reach terminals that
-are already running.
+**You must open a new PowerShell session afterwards.** The installer adds the
+program directory to your user `PATH`, and Windows only reads `PATH` when a
+shell starts — so `cagent` will not be recognised in the session you installed
+from, no matter what you do to it. Close it, open a new one, then run `cagent`.
+
+The same applies to cmd and Windows Terminal tabs that were already open.
 
 ### What gets installed, and where
 

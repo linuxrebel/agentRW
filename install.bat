@@ -57,7 +57,7 @@ if not exist "%PREFIX%" mkdir "%PREFIX%"
 if exist "%PREFIX%\tools" rmdir /S /Q "%PREFIX%\tools"
 copy /Y "%HERE%\coding_agent.py"  "%PREFIX%\" >nul
 copy /Y "%HERE%\requirements.txt" "%PREFIX%\" >nul
-for %%F in (README.md PLUGINS.md FUTURES.md LICENSE uninstall.bat) do (
+for %%F in (README.md PLUGINS.md FUTURES.md How-to-create-plugins.docx LICENSE uninstall.bat) do (
     if exist "%HERE%\%%F" copy /Y "%HERE%\%%F" "%PREFIX%\" >nul
 )
 if exist "%HERE%\tools" (

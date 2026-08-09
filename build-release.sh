@@ -21,7 +21,7 @@ cp -a coding_agent.py requirements.txt install.sh uninstall.sh "$DEST"/
 for b in install.bat uninstall.bat; do
     sed 's/$/\r/' "$b" > "$DEST/$b"
 done
-for f in README.md PLUGINS.md FUTURES.md LICENSE; do
+for f in README.md PLUGINS.md FUTURES.md How-to-create-plugins.docx LICENSE; do
     [ -e "$f" ] && cp -a "$f" "$DEST"/
 done
 if [ -d tools ]; then

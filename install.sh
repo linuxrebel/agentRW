@@ -51,7 +51,7 @@ echo "Installing to $PREFIX"
 mkdir -p "$PREFIX"
 rm -rf "$PREFIX"/*.py "$PREFIX"/*.md "$PREFIX"/requirements.txt "$PREFIX"/tools
 cp -a "$HERE"/coding_agent.py "$HERE"/requirements.txt "$PREFIX"/
-for f in README.md PLUGINS.md FUTURES.md LICENSE uninstall.sh; do
+for f in README.md PLUGINS.md FUTURES.md How-to-create-plugins.docx LICENSE uninstall.sh; do
     [ -e "$HERE/$f" ] && cp -a "$HERE/$f" "$PREFIX"/
 done
 [ -d "$HERE/tools" ] && cp -a "$HERE/tools" "$PREFIX"/ || mkdir -p "$PREFIX/tools"

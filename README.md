@@ -85,8 +85,8 @@ Build a release tarball from a checkout:
 ### Linux / macOS — system-wide
 
 ```bash
-tar -xzf agentRW-1.2.8.tar.gz
-sudo ./agentRW-1.2.8/install.sh
+tar -xzf agentRW-1.2.9.tar.gz
+sudo ./agentRW-1.2.9/install.sh
 ```
 
 Needs root, because it writes to `/opt` and `/usr/local/bin`. Run it without
@@ -97,8 +97,8 @@ Needs root, because it writes to `/opt` and `/usr/local/bin`. Run it without
 In **PowerShell**:
 
 ```powershell
-tar -xzf agentRW-1.2.8.tar.gz
-.\agentRW-1.2.8\install.bat
+tar -xzf agentRW-1.2.9.tar.gz
+.\agentRW-1.2.9\install.bat
 ```
 
 Installs under `%LOCALAPPDATA%`, so no administrator rights are needed.
@@ -124,8 +124,9 @@ The same applies to any Windows Terminal tab that was already open.
 | your config | `~/.config/coding_agent/` | `%APPDATA%\coding_agent\` |
 | privilege | root | none |
 
-The install directory holds `coding_agent.py`, `requirements.txt`, the docs,
-`tools/`, and the uninstaller. Nothing is written anywhere else.
+The install directory holds `coding_agent.py`, `requirements.txt`, the docs —
+including `How-to-create-plugins.docx`, the plugin guide in Word form — an
+empty `tools/`, and the uninstaller. Nothing is written anywhere else.
 
 Neither launcher is a symlink. On Unix `#!/usr/bin/env python3` is not
 dependable — on macOS `/usr/bin/python3` is a dispatcher stub that resolves
@@ -320,7 +321,15 @@ if shutil.which("pylint"):
 
 Miss the requirement and the command is never registered — **absent, not
 broken**. It does not appear in `/help` and `/lint` falls through to the model
-like any unknown word. `/plugins` shows what is registered and what is dormant.
+like any unknown word.
+
+`/plugins` shows what is registered, what is dormant, and — for anything
+missing — the command to install it on your platform:
+
+```
+linuxrebel/runtests ACTIVE   tools: run_tests
+    needs pytest: MISSING   pip: pytest  fedora: python3-pytest  debian: python3-pytest
+```
 
 **Commands are free; tools are not.** A command costs nothing until you invoke
 it. A tool's docstring rides in the system prompt, which is re-sent with *every*
@@ -364,7 +373,9 @@ cannot alter the code either side of the whitespace. It is not advertised to
 the model — nothing calls it but other plugins and you, so it costs nothing.
 
 Writing one: see [PLUGINS.md](PLUGINS.md) — conventions, the `ctx` API, the five
-contract obligations, and the trust model.
+contract obligations, and the trust model. The same guide ships as
+`How-to-create-plugins.docx` for anyone who would rather read a document, and
+all three plugins above are small enough to read as worked examples.
 
 ---
 

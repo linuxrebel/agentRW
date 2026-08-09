@@ -111,9 +111,7 @@ echo
 echo "Python packages (as your normal user, not root):"
 echo "    pip install --user -r $PREFIX/requirements.txt"
 echo
-echo "Only if you work on Python: the bundled formatting plugin wants autopep8."
-echo "    Fedora  sudo dnf install python3-autopep8"
-echo "    Debian  sudo apt install python3-autopep8"
-echo "Nothing else is needed. Plugins say so themselves in /plugins."
+echo "That is the whole list. No plugins ship with the agent — each lives in its"
+echo "own repo, and says what it needs itself in /plugins."
 echo
 echo "Uninstall with:  sudo $PREFIX/uninstall.sh"

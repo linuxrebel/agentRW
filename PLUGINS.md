@@ -315,9 +315,16 @@ Remove the directory. The tools and commands disappear with it.
 
 ## Worked example
 
-`tools/linuxrebel/format/` is the smallest complete plugin: one tool, a
-`REQUIRES` block, a clear error when autopep8 is absent, and no command.
+No plugins ship with the agent, so the examples are repos you can read:
 
-`tools/linuxrebel/lint/` is the full shape: a tool, a gated command, `help`, plain
-English translation of a detector's messages, and per-finding classification of
-how a fix can be applied.
+[**arwPyFormat**](https://github.com/linuxrebel/arwPyFormat) is the smallest
+complete plugin: one tool, a `REQUIRES` block, a clear error when autopep8 is
+absent, and no command. Around 50 lines.
+
+[**arwRunTests**](https://github.com/linuxrebel/arwRunTests) is the middle
+shape: a tool, a gated command with `help`, its own state file in `PLUGIN_DIR`,
+and a self-check under `__main__`.
+
+[**arwLint**](https://github.com/linuxrebel/arwLint) is the full shape: plain
+English translation of a detector's messages, per-finding classification of how
+a fix can be applied, and a run it reverts if the result stops compiling.

@@ -96,10 +96,8 @@ echo.
 echo Python packages:
 echo     pip install --user -r "%PREFIX%\requirements.txt"
 echo.
-echo Only if you work on Python - the bundled formatting plugin wants autopep8:
-echo     python -m pip install --user autopep8
-echo.
-echo Nothing else is needed. Plugins say so themselves in /plugins.
+echo That is the whole list. No plugins ship with the agent - each lives in its
+echo own repo, and says what it needs itself in /plugins.
 echo.
 echo Uninstall with:  "%PREFIX%\uninstall.bat"
 endlocal

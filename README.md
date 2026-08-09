@@ -63,20 +63,11 @@ That is the whole list. **agentRW is not a Python-only tool** — it edits and
 runs whatever you point it at, and nothing beyond the above is needed to use it
 for Go, Rust, shell or anything else.
 
-Plugins declare their own requirements and stay dormant, with a clear message
-in `/plugins`, when those are missing. Nothing else is affected. The bundled
-`linuxrebel/format` plugin wants `autopep8`, and is worth installing only if
-you work on Python:
-
-```bash
-sudo dnf install python3-autopep8      # Fedora
-sudo apt install python3-autopep8      # Debian, Ubuntu
-python3 -m pip install --user autopep8 # anywhere
-```
-
-Prefer the distro package — pip on top of a distro Python is a known way to
-break it. The plugin invokes `autopep8` as an executable on `PATH`, so either
-source works.
+**No plugins ship with the agent.** Every plugin lives in its own repo and is
+installed only if you want it, so a Go or Rust user installs nothing Python at
+all. Each declares its own requirements and stays dormant, with a clear message
+in `/plugins` naming what is missing and how to install it. Nothing else is
+affected.
 
 ---
 
@@ -348,26 +339,29 @@ advertised:
 `--low-vram` does the last one automatically. A plugin's command still works
 whether or not its tool is advertised, because the plugin calls it directly.
 
-One plugin ships with the agent:
+No plugins ship with the agent. Each lives in its own repo, with its own
+install instructions and its own README saying what it will do to your files:
 
-| plugin | provides | needs |
-|---|---|---|
-| `linuxrebel/format` | `format_file` | autopep8 |
-
-It is not advertised to the model — nothing calls it but other plugins and you,
-so it costs no tokens.
-
-### Available separately
-
-| plugin | provides | where |
-|---|---|---|
-| `linuxrebel/lint` | `lint_file`, `/lint` | [arwLint](https://github.com/linuxrebel/arwLint) |
+| plugin | provides | needs | where |
+|---|---|---|---|
+| `linuxrebel/format` | `format_file` | autopep8 | [arwPyFormat](https://github.com/linuxrebel/arwPyFormat) |
+| `linuxrebel/lint` | `lint_file`, `/lint` | pylint, autopep8 | [arwLint](https://github.com/linuxrebel/arwLint) |
+| `linuxrebel/runtests` | `run_tests`, `/runtests` | pytest | [arwRunTests](https://github.com/linuxrebel/arwRunTests) |
 
 **`/lint <file>`** walks pylint findings one at a time — fix, skip, ignore the
 whole kind, defer to `DEBT.md`, or see the raw message. It explains what each
 finding means in plain English, hands every style finding to autopep8 without
-asking, and reverts the entire run if the result no longer compiles. Install
-instructions are in its own README.
+asking, and reverts the entire run if the result no longer compiles.
+
+**`/runtests`** runs the pytest suite and reports the result in ~150 tokens
+instead of thousands. `/runtests baseline` then `/runtests verify` tells you
+whether a change broke something that used to pass — the one check a linter
+structurally cannot do, since pylint scores a semantically broken file exactly
+as it scored the working one.
+
+**`format_file`** fixes PEP 8 with autopep8 in one subprocess, no tokens, and
+cannot alter the code either side of the whitespace. It is not advertised to
+the model — nothing calls it but other plugins and you, so it costs nothing.
 
 Writing one: see [PLUGINS.md](PLUGINS.md) — conventions, the `ctx` API, the five
 contract obligations, and the trust model.

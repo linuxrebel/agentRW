@@ -510,7 +510,13 @@ def _load_one(pkg: Path, found: Dict[str, Any]) -> None:
                               "error": f"needs API {meta['api']}, host is {PLUGIN_API}"})
         return
 
+    # install.md's `## Requires` names what is needed; a module-level REQUIRES
+    # dict carries how to install it per platform. Both are merged here, since
+    # keeping only the first left /plugins printing "needs pylint: MISSING"
+    # with no way to resolve it — the hints PLUGINS.md tells authors to write
+    # were being collected and then dropped.
     tools, cmds = [], []
+    requires: Dict[str, Dict[str, str]] = {r: {} for r in meta["requires"]}
     for rel in meta["files"]:
         if not rel.endswith(".py"):
             continue                      # data the plugin declared, not code
@@ -534,6 +540,12 @@ def _load_one(pkg: Path, found: Dict[str, Any]) -> None:
             print(f"[tools] skipped {ident}/{rel}: {type(e).__name__}: {e}")
             PLUGIN_STATUS.append({"file": ident, "error": f"{type(e).__name__}: {e}"})
             return
+        # A requirement named only in REQUIRES and not in install.md is still
+        # reported. Hiding a real requirement is worse than a manifest that is
+        # not quite complete, and the author sees the mismatch in /plugins.
+        for _need, _how in (getattr(mod, "REQUIRES", None) or {}).items():
+            if isinstance(_how, dict):
+                requires.setdefault(_need, {}).update(_how)
         for name, fn in vars(mod).items():
             if name.endswith("_tool") and callable(fn):
                 found[name[:-len("_tool")]] = fn
@@ -551,7 +563,7 @@ def _load_one(pkg: Path, found: Dict[str, Any]) -> None:
     PLUGIN_STATUS.append({
         "file": ident, "name": meta.get("name", ident),
         "version": meta.get("version", "?"), "tools": tools, "commands": cmds,
-        "requires": {r: {} for r in meta["requires"]},
+        "requires": requires,
     })
 
 

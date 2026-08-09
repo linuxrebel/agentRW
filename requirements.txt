@@ -6,19 +6,11 @@ prompt_toolkit>=3.0.0
 # Windows only: ANSI colors on consoles that lack native VT support.
 colorama>=0.4.6; sys_platform == "win32"
 
-# Plugin dependencies are NOT listed here. A plugin declares what it needs in
-# its own install.md, gates its own registration, and stays dormant with a
-# clear message when a requirement is absent — see PLUGINS.md.
+# Plugin dependencies are NOT listed here, and no plugin ships with the agent.
+# A plugin lives in its own repo, declares what it needs in its own install.md,
+# gates its own registration, and stays dormant with a clear message when a
+# requirement is absent — see PLUGINS.md.
 #
 # That matters because agentRW is not a Python-only tool. Someone using it for
-# Go, Rust or shell should not be installing Python linters to run the harness.
-# The bundled linuxrebel/format plugin wants autopep8; install it only if you
-# work on Python and want the formatting pass:
-#
-#     Fedora   sudo dnf install python3-autopep8
-#     Debian   sudo apt install python3-autopep8
-#     pip      python3 -m pip install --user autopep8
-#
-# Distro packages are the better option — pip on top of a distro Python is a
-# known way to break it. The plugin invokes autopep8 as an executable on PATH,
-# so either source works.
+# Go, Rust or shell should not be installing Python linters to run the harness,
+# and now installs none of them: the above is the entire dependency list.

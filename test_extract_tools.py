@@ -319,13 +319,24 @@ def test_native_tool_calls_are_read():
     assert ca._reply_text(types.SimpleNamespace(content="hi", tool_calls=None)) == "hi"
     assert ca._reply_text(types.SimpleNamespace(content=None, tool_calls=None)) == ""
 
-    # schema is derived from the registry, so plugins are included
-    names = {t["function"]["name"] for t in ca.TOOLS_SCHEMA}
-    assert names == set(ca.TOOL_REGISTRY), names
-    rf = next(t for t in ca.TOOLS_SCHEMA if t["function"]["name"] == "read_file")
+    # schema is derived from the advertised set, so plugins are included while
+    # they are advertised — and drop out of the schema when they are not.
+    schema = ca._tools_schema()
+    names = {t["function"]["name"] for t in schema}
+    assert names == set(ca._active_tools), names
+    rf = next(t for t in schema if t["function"]["name"] == "read_file")
     params = rf["function"]["parameters"]
     assert params["required"] == ["filename"], params
     assert params["properties"]["start_line"]["type"] == "integer", params
+
+    # unadvertising a tool removes its schema too. Before this, the prompt
+    # dropped it and the schema kept shipping it every turn.
+    ca._active_tools.discard("read_file")
+    try:
+        assert "read_file" not in {t["function"]["name"] for t in ca._tools_schema()}
+    finally:
+        ca._active_tools.add("read_file")
+    assert "read_file" in {t["function"]["name"] for t in ca._tools_schema()}
 
 
 def test_command_aliases():
@@ -369,8 +380,38 @@ def test_json_tool_call_format():
         assert ca.extract_tools(text) == want, (text, ca.extract_tools(text))
 
 
+def test_advertising_defaults():
+    """Core is advertised, plugins are not, `model_facing` overrides either —
+    and none of it changes what is callable."""
+    import coding_agent as ca
+
+    def plugin_default(path: str) -> dict:
+        """Plugin tool, no opinion."""
+    def plugin_opted_in(path: str) -> dict:
+        """Plugin tool that wants the model."""
+    plugin_opted_in.model_facing = True
+    def core_opted_out(path: str) -> dict:
+        """Core tool that does not."""
+    core_opted_out.model_facing = False
+
+    registry = {**ca.CORE_TOOLS, "core_opted_out": core_opted_out,
+                "plugin_default": plugin_default,
+                "plugin_opted_in": plugin_opted_in}
+    core = {*ca.CORE_TOOLS, "core_opted_out"}
+    active = {n for n, f in registry.items()
+              if getattr(f, "model_facing", n in core)}
+
+    assert "read_file" in active, active
+    assert "plugin_default" not in active, active
+    assert "plugin_opted_in" in active, active
+    assert "core_opted_out" not in active, active
+    # unadvertised is not disabled: /name dispatch matches the registry
+    assert {"plugin_default", "core_opted_out"} <= set(registry)
+
+
 if __name__ == "__main__":
     test_extract_tools()
+    test_advertising_defaults()
     test_native_tool_calls_are_read()
     test_command_aliases()
     test_json_tool_call_format()

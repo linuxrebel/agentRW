@@ -257,24 +257,45 @@ improvement is defensible.
 | addition | cost |
 |---|---|
 | a command | **nothing** until you invoke it |
-| a tool | ~40 tokens in the system prompt, every turn, forever |
+| a tool | **nothing** until you advertise it |
+| a tool with `model_facing = True` | ~40 tokens in the system prompt, every turn, forever |
 | prompt text | not available — see below |
 
 Commands are free because nothing about them reaches the model until you type
 one. That is why `/lint` can afford a 90-line loop and long per-finding
 explanations: none of it is paid for unless used.
 
-Tools are not free. Twenty plugins each adding "just one tool" is 800 tokens
-off a 2048-token window before you have typed anything. Add a tool only when
-the model genuinely needs to call it; otherwise write a command.
+Plugin tools are free for the same reason, by default. A registered tool is
+always **callable** — `/your_tool arg` works, and the model can call it if it
+knows the name — but it is not **advertised** unless it says so. Advertised
+means its name, signature, and docstring sit in the system prompt and in the
+tool schema, re-sent on every single turn.
+
+```python
+def your_tool(path: str) -> dict:
+    """One short line. This is what the model reads."""
+    ...
+
+your_tool.model_facing = True   # advertise it — costs ~40 tokens/turn
+```
+
+Set it only when the model must reach for the tool unprompted to do its job.
+Twenty plugins each advertising "just one tool" is 800 tokens off a 2048-token
+window before you have typed anything. If the user is the one deciding when to
+run it — lint this file, run the tests — leave it unadvertised, or write a
+command instead.
+
+Either way the user has the final say per session: `/tools on <name>` and
+`/tools off <name>`, and `/tools` shows the current bill.
 
 **Plugins cannot add system prompt text.** There is no hook for it, by design.
 A plugin adding standing instructions would alter every future turn,
 invisibly and permanently — a much worse failure than any one-off action.
 
-Your tool's docstring is the one exception, since it must reach the model to be
-callable. It is capped at 240 characters, flattened to a single line, and
-stripped of control characters. Write a short, plain description.
+Your tool's docstring is the one exception, since an advertised tool has to
+describe itself to be used. It is capped at 240 characters, flattened to a
+single line, and stripped of control characters. Write a short, plain
+description.
 
 ---
 

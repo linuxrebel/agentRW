@@ -631,18 +631,41 @@ def _safe_doc(fn) -> str:
 # out of this set is still callable — it just is not advertised, and its
 # docstring stops being re-sent on every single request. That distinction is
 # the whole point: the system prompt is not loaded once, it is paid for per turn.
+#
+# Core is advertised by default, plugins are not. Plugins are the tools a user
+# reaches for deliberately — lint this, run the tests — not ones the model needs
+# volunteered on every turn to do its job, and their docstrings ran 52-57 tokens
+# each. A plugin that genuinely belongs in the model's hands sets
+# `model_facing = True` on the function; a core tool opts out with False.
+# `/tools on <name>` overrides either, per session.
 _active_tools = {n for n, f in TOOL_REGISTRY.items()
-                 if getattr(f, "model_facing", True)}
+                 if getattr(f, "model_facing", n in CORE_TOOLS)}
+
+
+def _sig_repr(fn) -> str:
+    """Signature as the model needs to see it: parameters only.
+
+    The return annotation is 18 characters of `-> Dict[str, Any]` on every tool,
+    re-sent every turn, telling the model nothing it does not already see — tool
+    results arrive as JSON regardless. Six core tools paid ~27 tokens for it.
+    """
+    return str(inspect.signature(fn)).split(" ->")[0]
+
+
+def _tool_block(name: str, fn) -> str:
+    """One tool's entry in the prompt. Cost accounting and the prompt itself
+    both render through here, so `/tools` can never quote a number the prompt
+    does not actually pay."""
+    return f"\n{name}\n{_sig_repr(fn)}\n{_safe_doc(fn)}\n---\n"
 
 
 def tool_cost(name: str) -> int:
-    fn = TOOL_REGISTRY[name]
-    return len(f"\n{name}\n{inspect.signature(fn)}\n{_safe_doc(fn)}\n\n----------------\n") // 4
+    return len(_tool_block(name, TOOL_REGISTRY[name])) // 4
 
 
 def build_prompt() -> str:
     tools = "".join(
-        f"\n{name}\n{inspect.signature(fn)}\n{_safe_doc(fn)}\n\n----------------\n"
+        _tool_block(name, fn)
         for name, fn in TOOL_REGISTRY.items() if name in _active_tools
     )
     dirs = "\n".join(f"  {d}" for d in [_agent_cwd[0], *_extra_write_dirs])
@@ -882,15 +905,23 @@ def _canonical_command(word: str) -> str:
 
 
 def _tools_schema() -> List[Dict[str, Any]]:
-    """OpenAI tool schema, derived from the same registry the prompt uses.
+    """OpenAI tool schema, derived from the same advertised set the prompt uses.
 
     Models with native tool calling need this to answer at all: without it
     gemma4:31b-cloud returned empty content on 2 of 3 attempts, because it
     wanted to emit a tool call and had no schema to emit against. With it,
     3 of 3. Costs nothing for models that ignore it.
+
+    Built per request, not once at import. As a module constant it was frozen
+    at the full registry, so `/tools off` and `--low-vram` dropped a tool from
+    the prompt and kept shipping its schema every turn — the saving they
+    reported was real only for models that ignore the schema entirely.
+    Unadvertised tools stay callable: dispatch matches TOOL_REGISTRY.
     """
     out = []
     for name, fn in TOOL_REGISTRY.items():
+        if name not in _active_tools:
+            continue
         props, required = {}, []
         for p, prm in inspect.signature(fn).parameters.items():
             props[p] = {"type": "integer" if prm.annotation is int else "string",
@@ -905,7 +936,6 @@ def _tools_schema() -> List[Dict[str, Any]]:
     return out
 
 
-TOOLS_SCHEMA = _tools_schema()
 
 
 def _reply_text(msg) -> str:
@@ -944,7 +974,7 @@ def call_llm(model: str, messages: list, gpu_layers: "Optional[List[Optional[int
                 options["num_ctx"] = num_ctx
             kw: Dict[str, Any] = {}
             if send_tools:
-                kw["tools"] = TOOLS_SCHEMA
+                kw["tools"] = _tools_schema()
             r = client.chat.completions.create(
                 model=model,
                 messages=working,

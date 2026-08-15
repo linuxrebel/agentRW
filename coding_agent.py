@@ -14,10 +14,12 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import types
 import threading
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -118,6 +120,7 @@ RESET_COLOR     = "\033[0m"  if _ANSI else ""
 SLASH_COMMANDS = (
     "/help", "/model", "/gpu-layers", "/low-vram", "/compact", "/tokens",
     "/reset", "/pwd", "/plugins", "/tools", "/ops", "/olist", "/cloud-models", "/update",
+    "/save",
     "/bye", "cd <path>",
 )
 
@@ -858,6 +861,171 @@ def extract_tools(text: str) -> List[Tuple[str, Dict[str, Any]]]:
 
 
 # -----------------------------
+# Session store
+#
+# The window is a rendered view of state, not a scrollback buffer. Everything
+# said or returned goes to SQLite the moment it exists; the window holds what
+# is useful now. Nothing is ever the only copy, so "evict" stops meaning
+# "destroy" and starts meaning "replace with a pointer".
+#
+# This is a single machine with a disk sitting idle, not a datacenter rationing
+# RAM. Forgetting to save space here was never a trade worth making.
+# -----------------------------
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS sessions (
+    id       INTEGER PRIMARY KEY,
+    started  TEXT NOT NULL,
+    model    TEXT,
+    cwd      TEXT,
+    title    TEXT
+);
+CREATE TABLE IF NOT EXISTS messages (
+    id         INTEGER PRIMARY KEY,
+    session_id INTEGER NOT NULL,
+    seq        INTEGER NOT NULL,
+    role       TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    summary    TEXT,
+    folded     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id, seq);
+CREATE TABLE IF NOT EXISTS state (
+    session_id INTEGER NOT NULL,
+    key        TEXT NOT NULL,
+    value      TEXT,
+    PRIMARY KEY (session_id, key)
+);
+CREATE TABLE IF NOT EXISTS artifacts (
+    id         INTEGER PRIMARY KEY,
+    session_id INTEGER NOT NULL,
+    saved      TEXT NOT NULL,
+    path       TEXT NOT NULL,
+    kind       TEXT
+);
+"""
+
+
+class SessionStore:
+    """Durable history for one session. Every message lands here first."""
+
+    def __init__(self, db_path: Path, model: str = "", cwd: str = ""):
+        self.path = db_path
+        self.db = None
+        self.session_id = None
+        try:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            self.db = sqlite3.connect(str(db_path))
+            self.db.executescript(SCHEMA)
+            cur = self.db.execute(
+                "INSERT INTO sessions (started, model, cwd) VALUES (?,?,?)",
+                (datetime.now().isoformat(timespec="seconds"), model, cwd))
+            self.session_id = cur.lastrowid
+            self.db.commit()
+        except (sqlite3.Error, OSError) as e:
+            # A broken store must never stop the agent running. Losing history
+            # is a worse session, not a dead one.
+            #
+            # OSError matters as much as sqlite3.Error: mkdir on an unwritable
+            # config directory raises it, and catching only the sqlite half
+            # meant a read-only home crashed the agent before the first prompt.
+            print(f"[Store] disabled: {e}")
+            self.db = None
+
+    @property
+    def live(self) -> bool:
+        return self.db is not None and self.session_id is not None
+
+    def add(self, seq: int, role: str, content: str, summary: str = "") -> None:
+        if not self.live:
+            return
+        try:
+            self.db.execute(
+                "INSERT INTO messages (session_id, seq, role, content, summary) "
+                "VALUES (?,?,?,?,?)",
+                (self.session_id, seq, role, content, summary))
+            self.db.commit()
+        except sqlite3.Error:
+            pass
+
+    def mark_folded(self, seq: int) -> None:
+        if not self.live:
+            return
+        try:
+            self.db.execute(
+                "UPDATE messages SET folded=1 WHERE session_id=? AND seq=?",
+                (self.session_id, seq))
+            self.db.commit()
+        except sqlite3.Error:
+            pass
+
+    def set_state(self, key: str, value: str) -> None:
+        if not self.live:
+            return
+        try:
+            self.db.execute(
+                "INSERT INTO state (session_id, key, value) VALUES (?,?,?) "
+                "ON CONFLICT(session_id, key) DO UPDATE SET value=excluded.value",
+                (self.session_id, key, value))
+            self.db.commit()
+        except sqlite3.Error:
+            pass
+
+    def save_artifact(self, path: str, kind: str = "") -> None:
+        if not self.live:
+            return
+        try:
+            self.db.execute(
+                "INSERT INTO artifacts (session_id, saved, path, kind) VALUES (?,?,?,?)",
+                (self.session_id, datetime.now().isoformat(timespec="seconds"),
+                 path, kind))
+            self.db.commit()
+        except sqlite3.Error:
+            pass
+
+    def export_markdown(self) -> str:
+        """The whole session as markdown — including what was folded away.
+
+        The point of storing everything is being able to get it back. What the
+        model saw is not what happened; this is what happened.
+        """
+        if not self.live:
+            return "# Session\n\n(store unavailable)\n"
+        row = self.db.execute(
+            "SELECT started, model, cwd FROM sessions WHERE id=?",
+            (self.session_id,)).fetchone()
+        goal = self.db.execute(
+            "SELECT value FROM state WHERE session_id=? AND key='goal'",
+            (self.session_id,)).fetchone()
+        out = [f"# Session {self.session_id}", "",
+               f"- **Started:** {row[0]}", f"- **Model:** {row[1]}",
+               f"- **Directory:** {row[2]}"]
+        if goal:
+            out += ["", "## Goal", "", goal[0]]
+        out += ["", "## Transcript", ""]
+        for seq, role, content, summary, folded in self.db.execute(
+                "SELECT seq, role, content, summary, folded FROM messages "
+                "WHERE session_id=? ORDER BY seq", (self.session_id,)):
+            mark = " *(folded out of context)*" if folded else ""
+            out.append(f"### {seq}. {role}{mark}")
+            if summary:
+                out.append(f"*{summary}*")
+            out += ["", "```", content, "```", ""]
+        return "\n".join(out) + "\n"
+
+    def counts(self) -> Tuple[int, int]:
+        """(messages stored, of which folded out of the window)."""
+        if not self.live:
+            return (0, 0)
+        try:
+            row = self.db.execute(
+                "SELECT COUNT(*), COALESCE(SUM(folded),0) FROM messages WHERE session_id=?",
+                (self.session_id,)).fetchone()
+            return (row[0], row[1])
+        except sqlite3.Error:
+            return (0, 0)
+
+
+# -----------------------------
 # Context compaction
 # -----------------------------
 def estimate_tokens(messages: list) -> int:
@@ -903,23 +1071,69 @@ def _cap_tool_result(text: str, budget_tokens: int = TOKEN_BUDGET) -> str:
     return text[:cap] + note
 
 
-def proactive_trim(messages: list, budget_tokens: int = TOKEN_BUDGET) -> int:
-    """Drop oldest non-system message pairs until under budget. Returns count dropped."""
+KEEP_VERBATIM = 6      # most recent messages never folded
+FOLD_FLOOR = 120       # a message this small is not worth folding
+
+
+def _fold_line(m: dict) -> str:
+    """The pointer that replaces a message's content in the window."""
+    seq = m.get("seq", "?")
+    summary = m.get("summary") or ""
+    if not summary:
+        body = " ".join(m.get("content", "").split())
+        summary = body[:80] + ("…" if len(body) > 80 else "")
+    return f"[#{seq} folded — {summary}]"
+
+
+def proactive_trim(messages: list, budget_tokens: int = TOKEN_BUDGET,
+                   store: "Optional[SessionStore]" = None) -> int:
+    """Fold oldest foldable messages until under budget. Returns count folded.
+
+    Folding, not deleting. The full text is in SQLite; what stays in the window
+    is a pointer and the one-line summary the harness already computed for the
+    console. Deleting was the old behaviour and it destroyed the wrong end
+    first: on a real failure it dropped the question and the tool call — 37
+    chars — and kept the 8,839-char listing that caused the overflow.
+
+    Two things are never folded: the system prompt, and the goal — the first
+    thing the user asked. An agent that forgets its own task to make room for a
+    directory listing is not saving context, it is losing the plot.
+    """
     budget_chars = budget_tokens * _CHARS_PER_TOKEN
-    dropped = 0
+    folded = 0
     while True:
-        non_sys_chars = sum(
-            len(m.get("content", "")) for m in messages if m["role"] != "system"
-        )
-        if non_sys_chars <= budget_chars:
+        non_sys = [i for i, m in enumerate(messages) if m["role"] != "system"]
+        used = sum(len(messages[i].get("content", "")) for i in non_sys)
+        if used <= budget_chars:
             break
-        non_sys_idx = [i for i, m in enumerate(messages) if m["role"] != "system"]
-        if len(non_sys_idx) <= 2:
-            break
-        for i in sorted(non_sys_idx[:2], reverse=True):
-            del messages[i]
-        dropped += 2
-    return dropped
+
+        def foldable(idx_list):
+            return [i for i in idx_list
+                    if not messages[i].get("pinned")
+                    and not messages[i].get("folded")
+                    and len(messages[i].get("content", "")) > FOLD_FLOOR]
+
+        # Oldest first, outside the recent working set — this keeps the recent
+        # exchange reading as a conversation rather than a list of stubs.
+        candidates = foldable(non_sys[:-KEEP_VERBATIM])
+        if candidates:
+            i = candidates[0]
+        else:
+            # Nothing old left to fold and still over. Now go by size, because
+            # one oversized message inside the recent window can exceed the
+            # whole budget on its own — a 118-entry listing did exactly that.
+            # Age is the wrong key when the bytes are all in one place.
+            recent = foldable(non_sys[-KEEP_VERBATIM:-1] if len(non_sys) > 1 else [])
+            if not recent:
+                break
+            i = max(recent, key=lambda j: len(messages[j].get("content", "")))
+
+        if store is not None:
+            store.mark_folded(messages[i].get("seq", -1))
+        messages[i] = {**messages[i], "content": _fold_line(messages[i]),
+                       "folded": True}
+        folded += 1
+    return folded
 
 
 # -----------------------------
@@ -995,9 +1209,10 @@ def _reply_text(msg) -> str:
 
 def call_llm(model: str, messages: list, gpu_layers: "Optional[List[Optional[int]]]" = None,
              max_tokens: int = 2000, num_ctx: Optional[int] = None,
-             token_budget: int = TOKEN_BUDGET, send_tools: bool = True) -> str:
+             token_budget: int = TOKEN_BUDGET, send_tools: bool = True,
+             store: "Optional[SessionStore]" = None) -> str:
     budget = token_budget
-    trimmed = proactive_trim(messages, budget_tokens=budget)
+    trimmed = proactive_trim(messages, budget_tokens=budget, store=store)
     if trimmed:
         print(f"\n[Context] Proactively dropped {trimmed} old message(s). "
               f"~{estimate_tokens(messages):,} tokens remaining.")
@@ -1037,7 +1252,7 @@ def call_llm(model: str, messages: list, gpu_layers: "Optional[List[Optional[int
             if "exceed_context_size" in str(e) or getattr(e, "status_code", None) == 400:
                 # Halve the budget and reuse the one trimmer until it can't cut more.
                 budget = max(budget // 2, 200)
-                if not proactive_trim(working, budget_tokens=budget):
+                if not proactive_trim(working, budget_tokens=budget, store=store):
                     print(f"\n{ASSISTANT_COLOR}[Error]{RESET_COLOR} Context full and nothing left to trim.")
                     return ""
             else:
@@ -1461,6 +1676,30 @@ def run(model: str, gpu_layers: Optional[int] = None,
         {"role": "system", "content": build_prompt()}
     ]
 
+    store = SessionStore(SESSION_DB, model=model, cwd=str(_agent_cwd[0]))
+    seq = [0]     # list so the nested helper can bump it
+
+    def remember(role: str, content: str, summary: str = "",
+                 pinned: bool = False) -> dict:
+        """Add a message to the window and to disk in one step.
+
+        Every message goes to SQLite before it can be folded out of the window,
+        so folding never loses anything. pinned=True means it stays verbatim
+        for the whole session — used for the goal.
+        """
+        seq[0] += 1
+        m = {"role": role, "content": content, "seq": seq[0]}
+        if summary:
+            m["summary"] = summary
+        if pinned:
+            m["pinned"] = True
+        messages.append(m)
+        store.add(seq[0], role, content, summary)
+        return m
+
+    def goal_is_set() -> bool:
+        return any(m.get("pinned") for m in messages)
+
     while True:
         try:
             user = _read_input(f"{YOU_COLOR}You:{RESET_COLOR} ").strip()
@@ -1506,14 +1745,34 @@ def run(model: str, gpu_layers: Optional[int] = None,
 
         if user.lower() == "/compact":
             saved = compact_tool_results(messages, keep_recent=0)
-            dropped = proactive_trim(messages, budget_tokens=cfg["token_budget"])
+            dropped = proactive_trim(messages, budget_tokens=cfg["token_budget"], store=store)
             print(f"[Compact] {saved:,} chars freed from tool results. "
                   f"{dropped} messages dropped. "
                   f"~{estimate_tokens(messages):,} tokens remaining.")
             continue
 
         if user.lower() == "/tokens":
-            print(f"[Context] ~{estimate_tokens(messages):,} tokens in history.")
+            stored, folded_n = store.counts()
+            print(f"[Context] ~{estimate_tokens(messages):,} tokens in the window.")
+            if store.live:
+                print(f"[Store]   {stored} messages on disk, {folded_n} folded "
+                      f"out of the window and still recoverable.")
+            continue
+
+        if user.lower().startswith("/save"):
+            _arg = user[5:].strip()
+            _dest = resolve_abs_path(_arg) if _arg else \
+                _agent_cwd[0] / f"session-{store.session_id}.md"
+            if not _writable(_dest):
+                print(f"[Save] {_write_denied(_dest)['hint']}")
+                continue
+            try:
+                _dest.write_text(store.export_markdown(), encoding="utf-8")
+            except OSError as e:
+                print(f"[Save] {e}")
+                continue
+            store.save_artifact(str(_dest), "markdown")
+            print(f"[Save] Session written to {_dest}")
             continue
 
         if user.lower() == "/low-vram":
@@ -1803,9 +2062,18 @@ def run(model: str, gpu_layers: Optional[int] = None,
                 "[Use these exact paths in your tool calls. Do not modify them.]" +
                 cwd_block
             )
-            messages.append({"role": "user", "content": injected})
+            remember("user", injected, pinned=not goal_is_set())
         else:
-            messages.append({"role": "user", "content": user + cwd_block})
+            # The first thing asked is the goal, and it is pinned for the rest
+            # of the session. Everything else can be folded away to a pointer;
+            # the task cannot, because an agent that forgets what it was asked
+            # is not saving context, it is losing the plot.
+            first = not goal_is_set()
+            remember("user", user + cwd_block,
+                     summary=("goal: " + " ".join(user.split())[:70]) if first else "",
+                     pinned=first)
+            if first:
+                store.set_state("goal", user.strip())
 
         consecutive_errors = 0
         tool_calls_this_turn = 0
@@ -1816,7 +2084,7 @@ def run(model: str, gpu_layers: Optional[int] = None,
             try:
                 reply = call_llm(model, messages, gpu_layers=layers_ref,
                                  max_tokens=cfg["max_tokens"], num_ctx=cfg["num_ctx"],
-                                 token_budget=cfg["token_budget"])
+                                 token_budget=cfg["token_budget"], store=store)
             except KeyboardInterrupt:
                 print("\n[Cancelled]")
                 messages.pop()
@@ -1834,14 +2102,14 @@ def run(model: str, gpu_layers: Optional[int] = None,
 
             if not tools:
                 print(f"{ASSISTANT_COLOR}Assistant:{RESET_COLOR} {reply}")
-                messages.append({"role": "assistant", "content": reply})
+                remember("assistant", reply)
                 consecutive_errors = 0
                 break
 
             # Hard cap: prevent runaway tool-call loops
             tool_calls_this_turn += len(tools)
             if tool_calls_this_turn > MAX_TOOL_CALLS:
-                messages.append({"role": "assistant", "content": reply})
+                remember("assistant", reply)
                 messages.append({
                     "role": "user",
                     "content": (
@@ -1851,14 +2119,14 @@ def run(model: str, gpu_layers: Optional[int] = None,
                 })
                 final = call_llm(model, messages, gpu_layers=layers_ref,
                                  max_tokens=cfg["max_tokens"], num_ctx=cfg["num_ctx"],
-                                 token_budget=cfg["token_budget"])
+                                 token_budget=cfg["token_budget"], store=store)
                 if final:
                     print(f"{ASSISTANT_COLOR}Assistant:{RESET_COLOR} {final}")
-                    messages.append({"role": "assistant", "content": final})
+                    remember("assistant", final)
                 break
 
             # Record assistant's tool-call turn before injecting results
-            messages.append({"role": "assistant", "content": reply})
+            remember("assistant", reply, summary="tool call")
 
             turn_had_error = False
             for name, args in tools:
@@ -1894,11 +2162,13 @@ def run(model: str, gpu_layers: Optional[int] = None,
                             turn_had_error = True
 
                 print(f"[result] {_summarise_result(name, result)}")
-                messages.append({
-                    "role": "user",
-                    "content": _cap_tool_result(f"tool_result({json.dumps(result)})",
-                                                cfg["token_budget"]),
-                })
+                # The one-line summary already printed to the console is what
+                # replaces this in the window once it is folded. Computing it
+                # here costs nothing extra and means folding needs no model.
+                remember("user",
+                         _cap_tool_result(f"tool_result({json.dumps(result)})",
+                                          cfg["token_budget"]),
+                         summary=f"{name}: {_summarise_result(name, result)}")
 
             if turn_had_error:
                 consecutive_errors += 1
@@ -1946,6 +2216,10 @@ if sys.platform == "win32":
     _CONFIG_PATH = Path(os.environ.get("APPDATA", Path.home())) / "coding_agent" / "config.json"
 else:
     _CONFIG_PATH = Path.home() / ".config" / "coding_agent" / "config.json"
+
+# Beside the config, not in the working directory: history follows the user,
+# not whatever folder they happened to start in.
+SESSION_DB = _CONFIG_PATH.parent / "sessions.db"
 
 
 def _load_config() -> dict:

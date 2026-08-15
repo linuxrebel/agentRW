@@ -969,8 +969,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
     id         INTEGER PRIMARY KEY,
     session_id INTEGER NOT NULL,
     saved      TEXT NOT NULL,
-    path       TEXT NOT NULL,
-    kind       TEXT
+    path       TEXT NOT NULL
 );
 """
 
@@ -1040,14 +1039,14 @@ class SessionStore:
         except sqlite3.Error:
             pass
 
-    def save_artifact(self, path: str, kind: str = "") -> None:
+    def save_artifact(self, path: str) -> None:
         if not self.live:
             return
         try:
             self.db.execute(
-                "INSERT INTO artifacts (session_id, saved, path, kind) VALUES (?,?,?,?)",
+                "INSERT INTO artifacts (session_id, saved, path) VALUES (?,?,?)",
                 (self.session_id, datetime.now().isoformat(timespec="seconds"),
-                 path, kind))
+                 path))
             self.db.commit()
         except sqlite3.Error:
             pass
@@ -1101,22 +1100,6 @@ class SessionStore:
 def estimate_tokens(messages: list) -> int:
     return sum(len(m.get("content", "")) for m in messages) // _CHARS_PER_TOKEN
 
-
-def compact_tool_results(messages: list, keep_recent: int = 2) -> int:
-    """Truncate old tool_result messages in-place. Returns chars freed."""
-    indices = [
-        i for i, m in enumerate(messages)
-        if m["role"] == "user" and m.get("content", "").startswith("tool_result(")
-    ]
-    to_compress = indices[:-keep_recent] if keep_recent else indices
-    saved = 0
-    for i in to_compress:
-        orig = messages[i]["content"]
-        if len(orig) > 300:
-            compressed = orig[:300] + "…"
-            saved += len(orig) - len(compressed)
-            messages[i] = {**messages[i], "content": compressed}
-    return saved
 
 
 # A single tool result may take at most this share of the budget. The rest has
@@ -1814,11 +1797,12 @@ def run(model: str, gpu_layers: Optional[int] = None,
             continue
 
         if user.lower() == "/compact":
-            saved = compact_tool_results(messages, keep_recent=0)
-            dropped = proactive_trim(messages, budget_tokens=cfg["token_budget"], store=store)
-            print(f"[Compact] {saved:,} chars freed from tool results. "
-                  f"{dropped} messages dropped. "
-                  f"~{estimate_tokens(messages):,} tokens remaining.")
+            # budget 0: fold everything foldable now, rather than only enough
+            # to get under the limit. That is what asking to compact means.
+            folded = proactive_trim(messages, budget_tokens=0, store=store)
+            print(f"[Compact] {folded} message(s) folded to pointers, "
+                  f"full text kept on disk. "
+                  f"~{estimate_tokens(messages):,} tokens in the window.")
             continue
 
         if user.lower() == "/tokens":
@@ -1841,7 +1825,7 @@ def run(model: str, gpu_layers: Optional[int] = None,
             except OSError as e:
                 print(f"[Save] {e}")
                 continue
-            store.save_artifact(str(_dest), "markdown")
+            store.save_artifact(str(_dest))
             print(f"[Save] Session written to {_dest}")
             continue
 

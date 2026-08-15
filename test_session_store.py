@@ -120,7 +120,43 @@ def test_a_filter_matching_nothing_offers_a_way_out():
     print("  empty filter result stays actionable          ok")
 
 
+def test_errors_are_slugs_not_prose():
+    """Every error is a fixed identifier a caller can branch on. str(e) puts
+    prose in that slot — error="[Errno 21] Is a directory" is not a code."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        binary = Path(d) / "b.bin"
+        binary.write_bytes(bytes(range(256)))
+        me = str(Path(__file__).parent / "coding_agent.py")
+
+        checks = [
+            (ca.read_file_tool(d), "not_a_file"),
+            (ca.read_file_tool(str(binary)), "not_text"),
+            (ca.read_file_tool(me, start_line=10 ** 7), "start_line_past_end"),
+            (ca.search_file_tool(d, "x"), "not_a_file"),
+            (ca.list_files_tool(me), "not_a_directory"),
+            (ca.list_files_tool(str(Path(d) / "nope")), "directory_not_found"),
+        ]
+        for got, want in checks:
+            assert got.get("error") == want, f"expected {want}, got {got}"
+            assert got.get("hint"), f"{want} gives the caller nowhere to go"
+    print("  filesystem errors are stable slugs           ok")
+
+
+def test_search_reports_what_it_cut():
+    me = str(Path(__file__).parent / "coding_agent.py")
+    got = ca.search_file_tool(me, "e")
+    assert got["found"] > ca.MAX_SEARCH_MATCHES, "need a file with many hits"
+    assert len(got["matches"]) == ca.MAX_SEARCH_MATCHES
+    assert got["not_shown"] == got["found"] - ca.MAX_SEARCH_MATCHES
+    empty = ca.search_file_tool(me, "zzz-not-present-zzz")
+    assert empty["found"] == 0 and empty.get("hint")
+    print("  truncated search says how much it cut        ok")
+
+
 if __name__ == "__main__":
+    test_errors_are_slugs_not_prose()
+    test_search_reports_what_it_cut()
     test_arguments_are_parsed_as_tolerantly_as_calls()
     test_a_filter_matching_nothing_offers_a_way_out()
     test_fold_keeps_goal_and_loses_nothing()

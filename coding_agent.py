@@ -206,6 +206,32 @@ def _write_denied(p: Path) -> Dict[str, Any]:
 # -----------------------------
 # Tools
 # -----------------------------
+def _fs_error(e: Exception, path: Path, key: str = "file_path") -> Dict[str, Any]:
+    """Map a filesystem exception to a stable error slug.
+
+    Every tool ended its except chain with `return {"error": str(e)}`, which
+    put prose where every other error in this harness puts a fixed identifier:
+    passing a directory to read_file produced error="[Errno 21] Is a directory".
+    A caller cannot branch on that, and it is the only place the error contract
+    breaks. The raw text is still returned, as detail rather than as the name.
+    """
+    if isinstance(e, FileNotFoundError):
+        return {"error": "file_not_found", key: str(path),
+                "hint": "Check the path. Use list_files to see what is there."}
+    if isinstance(e, PermissionError):
+        return {"error": "permission_denied", key: str(path)}
+    if isinstance(e, IsADirectoryError):
+        return {"error": "not_a_file", key: str(path),
+                "hint": "This is a directory. Use list_files instead."}
+    if isinstance(e, NotADirectoryError):
+        return {"error": "not_a_directory", key: str(path),
+                "hint": "This is a file. Use read_file instead."}
+    if isinstance(e, UnicodeDecodeError):
+        return {"error": "not_text", key: str(path),
+                "hint": "This file is not UTF-8 text and cannot be read as lines."}
+    return {"error": "io_error", key: str(path), "detail": str(e)}
+
+
 def read_file_tool(
     filename: str,
     start_line: int = 1,
@@ -216,19 +242,19 @@ def read_file_tool(
     try:
         with open(path, "r", encoding="utf-8") as f:
             lines = f.readlines()
-    except FileNotFoundError:
-        return {
-            "error": "file_not_found",
-            "file_path": str(path),
-            "hint": "Use the exact full absolute path the user provided.",
-        }
-    except PermissionError:
-        return {"error": "permission_denied", "file_path": str(path)}
-    except Exception as e:
-        return {"error": str(e), "file_path": str(path)}
+    except OSError as e:
+        return _fs_error(e, path)
+    except UnicodeDecodeError as e:
+        return _fs_error(e, path)
 
     total = len(lines)
     start = max(start_line - 1, 0)
+    # Reading past the end returned content:"" with has_more:false — an empty
+    # answer indistinguishable from an empty file, and no way to tell which.
+    if start >= total and total:
+        return {"file_path": str(path), "total_lines": total,
+                "error": "start_line_past_end",
+                "hint": f"The file has {total} lines; start_line was {start_line}."}
     end = min(start + max_lines, total)
     return {
         "file_path": str(path),
@@ -299,13 +325,13 @@ def list_files_tool(path: str, pattern: str = "") -> Dict[str, Any]:
             out["hint"] = 'Call again with pattern= to narrow, e.g. pattern="*.py".'
         return out
     except FileNotFoundError:
-        return {"error": "directory_not_found", "path": str(p)}
-    except NotADirectoryError:
-        return {"error": "not_a_directory", "path": str(p)}
-    except PermissionError:
-        return {"error": "permission_denied", "path": str(p)}
-    except Exception as e:
-        return {"error": str(e), "path": str(p)}
+        # Kept distinct from _fs_error's file_not_found: for this tool the
+        # missing thing is a directory, and the generic hint ("use list_files")
+        # would be advice to call the tool that just failed.
+        return {"error": "directory_not_found", "path": str(p),
+                "hint": "Check the path, or list its parent."}
+    except OSError as e:
+        return _fs_error(e, p, key="path")
 
 
 def edit_file_tool(path: str, old_str: str, new_str: str) -> Dict[str, Any]:
@@ -335,12 +361,8 @@ def edit_file_tool(path: str, old_str: str, new_str: str) -> Dict[str, Any]:
 
         p.write_text(text.replace(old_str, new_str, 1), encoding="utf-8")
         return {"path": str(p), "action": "edited", "backup": str(bak)}
-    except FileNotFoundError:
-        return {"error": "file_not_found", "path": str(p)}
-    except PermissionError:
-        return {"error": "permission_denied", "path": str(p)}
-    except Exception as e:
-        return {"error": str(e), "path": str(p)}
+    except OSError as e:
+        return _fs_error(e, p, key="path")
 
 
 MAX_CAPTURE_BYTES = 1_000_000  # per stream, before the command is killed
@@ -428,8 +450,11 @@ def run_command_tool(cmd: str, timeout: int = 30) -> Dict[str, Any]:
         return result
     except subprocess.TimeoutExpired:
         return {"error": "timeout", "hint": f"Command exceeded {timeout}s. Use a shorter operation or increase timeout."}
-    except Exception as e:
-        return {"error": str(e)}
+    except OSError as e:
+        return {"error": "command_failed", "detail": str(e)}
+
+
+MAX_SEARCH_MATCHES = 100
 
 
 def search_file_tool(filename: str, text: str) -> Dict[str, Any]:
@@ -441,13 +466,23 @@ def search_file_tool(filename: str, text: str) -> Dict[str, Any]:
             for i, line in enumerate(f, start=1):
                 if text.lower() in line.lower():
                     matches.append({"line": i, "content": line.rstrip()})
-        return {"file_path": str(p), "matches": matches[:100]}
-    except FileNotFoundError:
-        return {"error": "file_not_found", "file_path": str(p)}
-    except PermissionError:
-        return {"error": "permission_denied", "file_path": str(p)}
-    except Exception as e:
-        return {"error": str(e), "file_path": str(p)}
+    except OSError as e:
+        return _fs_error(e, p)
+    except UnicodeDecodeError as e:
+        return _fs_error(e, p)
+
+    # matches[:100] used to be returned with no indication that anything was
+    # cut, so 500 hits and 100 hits looked identical and the caller had no
+    # reason to doubt it had seen everything. A truncated answer that does not
+    # say so is worse than a smaller one that does.
+    out: Dict[str, Any] = {"file_path": str(p), "found": len(matches),
+                           "matches": matches[:MAX_SEARCH_MATCHES]}
+    if len(matches) > MAX_SEARCH_MATCHES:
+        out["not_shown"] = len(matches) - MAX_SEARCH_MATCHES
+        out["hint"] = "Narrow the search text to see the rest."
+    if not matches:
+        out["hint"] = f'No line contains "{text}" in this file.'
+    return out
 
 
 def write_file_tool(filename: str, content: str) -> Dict[str, Any]:
@@ -467,10 +502,8 @@ def write_file_tool(filename: str, content: str) -> Dict[str, Any]:
         p.write_text(content, encoding="utf-8")
         return {"path": str(p), "action": "written",
                 "backup": str(bak) if existed else None}
-    except PermissionError:
-        return {"error": "permission_denied", "path": str(p)}
-    except Exception as e:
-        return {"error": str(e), "path": str(p)}
+    except OSError as e:
+        return _fs_error(e, p, key="path")
 
 
 CORE_TOOLS = {

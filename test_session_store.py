@@ -93,7 +93,36 @@ def test_oversized_single_result_is_capped():
     print("  oversized tool result capped, and says so     ok")
 
 
+def test_arguments_are_parsed_as_tolerantly_as_calls():
+    """The harness salvages malformed tool calls. It has to do the same for
+    the values inside them, or the tolerance stops at the envelope."""
+    here = Path(__file__).parent
+    plain = ca.read_file_tool(str(here / "coding_agent.py"), max_lines=1)
+    assert "error" not in plain, plain
+
+    for wrapped in ('"{}"', "'{}'", " {} "):
+        arg = wrapped.format(here / "coding_agent.py")
+        got = ca.read_file_tool(arg, max_lines=1)
+        assert "error" not in got, f"{arg!r} should resolve, got {got}"
+        assert got["total_lines"] == plain["total_lines"]
+    print("  quoted and padded paths resolve               ok")
+
+
+def test_a_filter_matching_nothing_offers_a_way_out():
+    here = str(Path(__file__).parent)
+    # Junk that is syntactically a pattern but matches nothing.
+    got = ca.list_files_tool(here, "(<!DOCTYPE html>)|(html)")
+    assert got["names"] == []
+    assert got["entries_without_pattern"] > 0, "must say what is actually there"
+    assert "hint" in got, "a dead end is a harness failure, not an answer"
+    # And a pattern Path.match rejects outright must not end the turn.
+    assert "error" not in ca.list_files_tool(here, "[")
+    print("  empty filter result stays actionable          ok")
+
+
 if __name__ == "__main__":
+    test_arguments_are_parsed_as_tolerantly_as_calls()
+    test_a_filter_matching_nothing_offers_a_way_out()
     test_fold_keeps_goal_and_loses_nothing()
     test_a_broken_store_does_not_stop_the_agent()
     test_oversized_single_result_is_capped()

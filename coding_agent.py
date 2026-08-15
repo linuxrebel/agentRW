@@ -154,7 +154,19 @@ _extra_write_dirs: List[Path] = []
 
 
 def resolve_abs_path(path_str: str) -> Path:
-    p = Path(path_str).expanduser()
+    # Strip a matched pair of surrounding quotes. The harness parses tool
+    # *calls* tolerantly — JSON, Python literals, regex salvage — and then
+    # treated argument *values* as sacred, so a path arriving as '"/tmp/x"'
+    # became a filename containing quote characters and returned
+    # file_not_found. Being lenient about the envelope and strict about the
+    # contents is not a principle, it is an oversight. A real filename wrapped
+    # in matching quotes is vanishingly rare; a quoting artefact is not.
+    s = path_str.strip()
+    for q in ('"', "'"):
+        if len(s) > 1 and s[0] == q and s[-1] == q:
+            s = s[1:-1].strip()
+            break
+    p = Path(s).expanduser()
     return p if p.is_absolute() else (_agent_cwd[0] / p).resolve()
 
 
@@ -231,6 +243,19 @@ def read_file_tool(
 MAX_LISTED_ENTRIES = 40   # names returned before the rest becomes a count
 
 
+def _safe_match(path: Path, pattern: str) -> bool:
+    """Glob match that treats a malformed pattern as 'no match', not a crash.
+
+    Path.match raises on some inputs. A bad argument should produce a result
+    the caller can act on — see the hint returned when nothing matched —
+    rather than an exception that ends the turn.
+    """
+    try:
+        return path.match(pattern)
+    except (ValueError, IndexError, re.error):
+        return False
+
+
 def list_files_tool(path: str, pattern: str = "") -> Dict[str, Any]:
     """List a directory. Dirs end in /, symlinks @. pattern filters by glob."""
     p = resolve_abs_path(path)
@@ -242,15 +267,27 @@ def list_files_tool(path: str, pattern: str = "") -> Dict[str, Any]:
         # matter what history was dropped. ls-style suffixes carry the type in
         # one character instead of a "type" field per entry.
         names = []
-        dirs = files = 0
+        dirs = files = total = 0
         for x in sorted(p.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
-            if pattern and not x.match(pattern):
+            total += 1
+            if pattern and not _safe_match(x, pattern):
                 continue
             if x.is_dir():
                 dirs += 1
             else:
                 files += 1
             names.append(x.name + ("/" if x.is_dir() else "") + ("@" if x.is_symlink() else ""))
+
+        # A filter that matched nothing used to return "0 entries" and stop
+        # there — a dead end, when the harness knew perfectly well the directory
+        # held 118 files. Saying what is actually there, and that dropping the
+        # filter is the way forward, costs a few tokens and ends the guessing.
+        if pattern and not names:
+            return {"path": str(p), "dirs": 0, "files": 0, "names": [],
+                    "pattern": pattern, "entries_without_pattern": total,
+                    "hint": f"Nothing matched. {total} entries exist here — "
+                            f"call again without pattern, or try a simpler one "
+                            f'like "*.py".'}
 
         out: Dict[str, Any] = {"path": str(p), "dirs": dirs, "files": files,
                                "names": names[:MAX_LISTED_ENTRIES]}

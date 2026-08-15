@@ -225,21 +225,39 @@ def read_file_tool(
     }
 
 
-def list_files_tool(path: str) -> Dict[str, Any]:
-    """List files in a directory."""
+MAX_LISTED_ENTRIES = 40   # names returned before the rest becomes a count
+
+
+def list_files_tool(path: str, pattern: str = "") -> Dict[str, Any]:
+    """List a directory. Dirs end in /, symlinks @. pattern filters by glob."""
     p = resolve_abs_path(path)
     try:
-        entries = []
+        # Names only. The old shape returned name AND the full absolute path for
+        # every entry, so the parent directory was repeated once per file: on a
+        # 118-entry home directory that was 8,839 chars — 2,209 tokens, more
+        # than a 2048-token window holds, which made the turn unrecoverable no
+        # matter what history was dropped. ls-style suffixes carry the type in
+        # one character instead of a "type" field per entry.
+        names = []
+        dirs = files = 0
         for x in sorted(p.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
-            entry = {
-                "name": x.name,
-                "path": str(x),
-                "type": "dir" if x.is_dir() else "file",
-            }
-            if x.is_symlink():
-                entry["symlink_target"] = str(x.resolve())
-            entries.append(entry)
-        return {"path": str(p), "files": entries}
+            if pattern and not x.match(pattern):
+                continue
+            if x.is_dir():
+                dirs += 1
+            else:
+                files += 1
+            names.append(x.name + ("/" if x.is_dir() else "") + ("@" if x.is_symlink() else ""))
+
+        out: Dict[str, Any] = {"path": str(p), "dirs": dirs, "files": files,
+                               "names": names[:MAX_LISTED_ENTRIES]}
+        if pattern:
+            out["pattern"] = pattern
+        hidden = len(names) - MAX_LISTED_ENTRIES
+        if hidden > 0:
+            out["not_shown"] = hidden
+            out["hint"] = 'Call again with pattern= to narrow, e.g. pattern="*.py".'
+        return out
     except FileNotFoundError:
         return {"error": "directory_not_found", "path": str(p)}
     except NotADirectoryError:
@@ -863,6 +881,28 @@ def compact_tool_results(messages: list, keep_recent: int = 2) -> int:
     return saved
 
 
+# A single tool result may take at most this share of the budget. The rest has
+# to stay free for the system prompt, the question, and the answer.
+TOOL_RESULT_SHARE = 0.5
+
+
+def _cap_tool_result(text: str, budget_tokens: int = TOKEN_BUDGET) -> str:
+    """Truncate one tool result that would not leave room for anything else.
+
+    proactive_trim can only delete whole messages, oldest first, so a single
+    result bigger than the window is unrecoverable: it drops the question and
+    the tool call — 37 chars on a real failure — and keeps the 8,839-char
+    listing that caused the problem. Capping here means the turn degrades to a
+    partial answer instead of dying, and says so rather than silently lying
+    about what the tool returned.
+    """
+    cap = int(budget_tokens * TOOL_RESULT_SHARE) * _CHARS_PER_TOKEN
+    if len(text) <= cap:
+        return text
+    note = f"… [truncated: {len(text) - cap:,} of {len(text):,} chars cut to fit the context window]"
+    return text[:cap] + note
+
+
 def proactive_trim(messages: list, budget_tokens: int = TOKEN_BUDGET) -> int:
     """Drop oldest non-system message pairs until under budget. Returns count dropped."""
     budget_chars = budget_tokens * _CHARS_PER_TOKEN
@@ -1373,8 +1413,10 @@ def _summarise_result(tool_name: str, result: dict) -> str:
     if "error" in result:
         return f"ERROR: {result['error']}  {result.get('hint', '')}"
     if tool_name == "list_files":
-        n = len(result.get("files", []))
-        return f"{n} entries in {result.get('path', '?')}"
+        n = result.get("dirs", 0) + result.get("files", 0)
+        shown = len(result.get("names", []))
+        return (f"{n} entries in {result.get('path', '?')}"
+                + (f" (showing {shown})" if shown < n else ""))
     if tool_name == "read_file":
         return (f"{result.get('total_lines', '?')} lines"
                 f"  [{result.get('file_path', '?')}]"
@@ -1854,7 +1896,8 @@ def run(model: str, gpu_layers: Optional[int] = None,
                 print(f"[result] {_summarise_result(name, result)}")
                 messages.append({
                     "role": "user",
-                    "content": f"tool_result({json.dumps(result)})"
+                    "content": _cap_tool_result(f"tool_result({json.dumps(result)})",
+                                                cfg["token_budget"]),
                 })
 
             if turn_had_error:

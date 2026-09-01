@@ -955,7 +955,8 @@ CREATE TABLE IF NOT EXISTS messages (
     role       TEXT NOT NULL,
     content    TEXT NOT NULL,
     summary    TEXT,
-    folded     INTEGER NOT NULL DEFAULT 0
+    folded     INTEGER NOT NULL DEFAULT 0,
+    no_index   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id, seq);
 CREATE TABLE IF NOT EXISTS state (
@@ -980,10 +981,12 @@ class SessionStore:
         self.path = db_path
         self.db = None
         self.session_id = None
+        self.fts = False
         try:
             db_path.parent.mkdir(parents=True, exist_ok=True)
             self.db = sqlite3.connect(str(db_path))
             self.db.executescript(SCHEMA)
+            self._ensure_fts()
             cur = self.db.execute(
                 "INSERT INTO sessions (started, model, cwd) VALUES (?,?,?)",
                 (datetime.now().isoformat(timespec="seconds"), model, cwd))
@@ -1003,17 +1006,123 @@ class SessionStore:
     def live(self) -> bool:
         return self.db is not None and self.session_id is not None
 
-    def add(self, seq: int, role: str, content: str, summary: str = "") -> None:
+    def add(self, seq: int, role: str, content: str, summary: str = "",
+            no_index: bool = False) -> None:
         if not self.live:
             return
         try:
             self.db.execute(
-                "INSERT INTO messages (session_id, seq, role, content, summary) "
-                "VALUES (?,?,?,?,?)",
-                (self.session_id, seq, role, content, summary))
+                "INSERT INTO messages (session_id, seq, role, content, summary, no_index) "
+                "VALUES (?,?,?,?,?,?)",
+                (self.session_id, seq, role, content, summary, int(no_index)))
             self.db.commit()
         except sqlite3.Error:
             pass
+
+    def _ensure_fts(self) -> None:
+        """Create the FTS5 shadow index + triggers, migrate old DBs, backfill once.
+
+        FTS5 is not in every sqlite build. If it is missing, self.fts stays False
+        and search() falls back to LIKE. Never raises past this method.
+        """
+        try:
+            cols = [r[1] for r in self.db.execute("PRAGMA table_info(messages)")]
+            if "no_index" not in cols:
+                self.db.execute("ALTER TABLE messages ADD COLUMN "
+                                "no_index INTEGER NOT NULL DEFAULT 0")
+            # Backfill is needed exactly once: when we create messages_fts over a
+            # database whose messages predate it. On every later open the table
+            # already exists and its triggers have kept it current, so we skip.
+            # (COUNT(*) on an external-content FTS5 table reflects the content
+            # table, not the index, so it cannot be used to detect this.)
+            existed = self.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='messages_fts'").fetchone() is not None
+            self.db.executescript("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                    content, summary, content='messages', content_rowid='id');
+                CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages
+                WHEN new.no_index = 0 BEGIN
+                    INSERT INTO messages_fts(rowid, content, summary)
+                    VALUES (new.id, new.content, new.summary);
+                END;
+                CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages
+                WHEN old.no_index = 0 BEGIN
+                    INSERT INTO messages_fts(messages_fts, rowid, content, summary)
+                    VALUES ('delete', old.id, old.content, old.summary);
+                END;
+                CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages
+                WHEN old.no_index = 0 BEGIN
+                    INSERT INTO messages_fts(messages_fts, rowid, content, summary)
+                    VALUES ('delete', old.id, old.content, old.summary);
+                    INSERT INTO messages_fts(rowid, content, summary)
+                    VALUES (new.id, new.content, new.summary);
+                END;
+            """)
+            if not existed:
+                self.db.execute(
+                    "INSERT INTO messages_fts(rowid, content, summary) "
+                    "SELECT id, content, summary FROM messages WHERE no_index = 0")
+            self.db.commit()
+            self.fts = True
+        except sqlite3.Error:
+            self.fts = False
+
+    def search(self, query: str, cwd: "Optional[str]" = None, k: int = 4) -> list:
+        """Top-k past-session matches: (session_id, seq, cwd, summary, snippet).
+
+        Excludes the current session. cwd filters to that directory; None = global.
+        Uses FTS5/bm25 when available, else a LIKE scan. Never raises.
+        """
+        if not self.live or not query.strip():
+            return []
+        try:
+            if self.fts:
+                sql = ("SELECT m.session_id, m.seq, s.cwd, m.summary, "
+                       "snippet(messages_fts, 0, '', '', '…', 12) "
+                       "FROM messages_fts "
+                       "JOIN messages m ON m.id = messages_fts.rowid "
+                       "LEFT JOIN sessions s ON s.id = m.session_id "
+                       "WHERE messages_fts MATCH ? AND m.session_id != ? "
+                       "AND (? IS NULL OR s.cwd = ?) "
+                       "ORDER BY bm25(messages_fts) LIMIT ?")
+                rows = self.db.execute(
+                    sql, (query, self.session_id, cwd, cwd, k)).fetchall()
+            else:
+                like = f"%{query}%"
+                sql = ("SELECT m.session_id, m.seq, s.cwd, m.summary, "
+                       "substr(m.content, 1, 160) "
+                       "FROM messages m LEFT JOIN sessions s ON s.id = m.session_id "
+                       "WHERE m.no_index = 0 AND m.content LIKE ? "
+                       "AND m.session_id != ? AND (? IS NULL OR s.cwd = ?) "
+                       "LIMIT ?")
+                rows = self.db.execute(
+                    sql, (like, self.session_id, cwd, cwd, k)).fetchall()
+            return [tuple(r) for r in rows]
+        except sqlite3.Error:
+            return []
+
+    def has_prior_history(self) -> bool:
+        if not self.live:
+            return False
+        try:
+            row = self.db.execute(
+                "SELECT 1 FROM messages WHERE session_id != ? LIMIT 1",
+                (self.session_id,)).fetchone()
+            return row is not None
+        except sqlite3.Error:
+            return False
+
+    def prior_sessions_for_cwd(self, cwd: str) -> int:
+        if not self.live:
+            return 0
+        try:
+            row = self.db.execute(
+                "SELECT COUNT(*) FROM sessions WHERE cwd = ? AND id != ?",
+                (cwd, self.session_id)).fetchone()
+            return row[0] if row else 0
+        except sqlite3.Error:
+            return 0
 
     def mark_folded(self, seq: int) -> None:
         if not self.live:

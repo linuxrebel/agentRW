@@ -154,6 +154,110 @@ def test_search_reports_what_it_cut():
     print("  truncated search says how much it cut        ok")
 
 
+# ---------------------------------------------------------------------------
+# Cross-session recall (FTS5)
+# ---------------------------------------------------------------------------
+def _seed(store, rows):
+    """rows: list of (session_id, seq, role, content, summary, no_index)."""
+    for sid, seq, role, content, summary, no_index in rows:
+        store.session_id = sid
+        store.add(seq, role, content, summary, no_index=no_index)
+
+
+def test_search_finds_past_sessions_by_keyword():
+    with tempfile.TemporaryDirectory() as d:
+        store = ca.SessionStore(Path(d) / "s.db", model="test", cwd="/proj/a")
+        if not store.fts:
+            print("  (fts5 unavailable — skipping keyword test)      ok")
+            return
+        cur_session = store.session_id
+        _seed(store, [
+            (10, 1, "user", "the auth token expiry bug in login.py", "auth bug", False),
+            (10, 2, "assistant", "fixed by using <= not <", "fix", False),
+            (11, 1, "user", "unrelated chatter about lunch", "lunch", False),
+        ])
+        store.session_id = cur_session          # search excludes current session
+        hits = store.search("auth token", cwd=None, k=4)
+        assert hits, "should find the auth message"
+        assert any("auth" in (h[3] or "") or "auth" in (h[4] or "") for h in hits)
+        assert all(h[0] != cur_session for h in hits), "must exclude current session"
+        print("  recall finds past-session keyword hits         ok")
+
+
+def test_search_scope_is_cwd_by_default_and_global_on_demand():
+    with tempfile.TemporaryDirectory() as d:
+        store = ca.SessionStore(Path(d) / "s.db", model="test", cwd="/proj/a")
+        if not store.fts:
+            print("  (fts5 unavailable — skipping scope test)        ok")
+            return
+        cur = store.session_id
+        store.db.execute("INSERT INTO sessions (id, started, model, cwd) "
+                         "VALUES (20,'t','m','/proj/a'),(21,'t','m','/proj/b')")
+        _seed(store, [
+            (20, 1, "user", "widget rendering glitch", "widget", False),
+            (21, 1, "user", "widget rendering glitch", "widget", False),
+        ])
+        store.session_id = cur
+        local = store.search("widget", cwd="/proj/a", k=4)
+        assert local and all(h[2] == "/proj/a" for h in local), "cwd scope failed"
+        allscope = store.search("widget", cwd=None, k=4)
+        assert {h[2] for h in allscope} >= {"/proj/a", "/proj/b"}, "global scope failed"
+        print("  recall scopes to cwd, global on demand          ok")
+
+
+def test_no_index_rows_are_not_recalled():
+    with tempfile.TemporaryDirectory() as d:
+        store = ca.SessionStore(Path(d) / "s.db", model="test", cwd="/proj/a")
+        if not store.fts:
+            print("  (fts5 unavailable — skipping no_index test)     ok")
+            return
+        cur = store.session_id
+        _seed(store, [
+            (30, 1, "user", "def frobnicate(): pass  # jquery blob", "read_file page", True),
+            (30, 2, "user", "we discussed frobnicate in the meeting", "discussion", False),
+        ])
+        store.session_id = cur
+        hits = store.search("frobnicate", cwd=None, k=4)
+        assert hits, "should find the discussion"
+        assert all(h[1] != 1 for h in hits), "raw file-page dump must not be recalled"
+        print("  raw file-page dumps excluded from recall        ok")
+
+
+def test_backfill_indexes_preexisting_rows():
+    with tempfile.TemporaryDirectory() as d:
+        dbp = Path(d) / "s.db"
+        s1 = ca.SessionStore(dbp, model="test", cwd="/proj/a")
+        if not s1.fts:
+            print("  (fts5 unavailable — skipping backfill test)     ok")
+            return
+        s1.session_id = 40
+        s1.add(1, "user", "backfill me: xyzzy marker", "seed", no_index=False)
+        s1.db.execute("DROP TABLE messages_fts")
+        s1.db.commit()
+        s1.db.close()
+        s2 = ca.SessionStore(dbp, model="test", cwd="/proj/a")   # should backfill
+        s2.session_id = 999
+        hits = s2.search("xyzzy", cwd=None, k=4)
+        assert hits, "backfill should make pre-existing rows searchable"
+        print("  backfill indexes pre-existing rows              ok")
+
+
+def test_history_flags():
+    with tempfile.TemporaryDirectory() as d:
+        store = ca.SessionStore(Path(d) / "s.db", model="test", cwd="/proj/a")
+        assert store.has_prior_history() is False, "fresh db has no prior history"
+        assert store.prior_sessions_for_cwd("/proj/a") == 0
+        store.db.execute("INSERT INTO sessions (id, started, model, cwd) "
+                         "VALUES (50,'t','m','/proj/a')")
+        store.db.execute("INSERT INTO messages (session_id, seq, role, content) "
+                         "VALUES (50,1,'user','hi')")
+        store.db.commit()
+        assert store.has_prior_history() is True
+        assert store.prior_sessions_for_cwd("/proj/a") == 1
+        assert store.prior_sessions_for_cwd("/proj/b") == 0
+        print("  prior-history flags report correctly            ok")
+
+
 if __name__ == "__main__":
     test_errors_are_slugs_not_prose()
     test_search_reports_what_it_cut()
@@ -162,4 +266,9 @@ if __name__ == "__main__":
     test_fold_keeps_goal_and_loses_nothing()
     test_a_broken_store_does_not_stop_the_agent()
     test_oversized_single_result_is_capped()
+    test_search_finds_past_sessions_by_keyword()
+    test_search_scope_is_cwd_by_default_and_global_on_demand()
+    test_no_index_rows_are_not_recalled()
+    test_backfill_indexes_preexisting_rows()
+    test_history_flags()
     print("all session-store tests passed")

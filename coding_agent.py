@@ -149,6 +149,9 @@ client = OpenAI(
 # -----------------------------
 _agent_cwd = [Path.cwd()]  # mutable so tools always pick up current value
 _active_store = [None]      # set by run(); lets recall_tool reach the live store
+_active_ingest = [None]     # set by run(); a closure that runs ingest_file with
+                            # the live model/store/layers/cfg, so ingest_tool can
+                            # trigger a digest without threading them through dispatch
 
 # Extra directories the model may write to, beyond the working directory.
 # Added with --allow-write. Reads are never restricted.
@@ -731,8 +734,23 @@ def recall_tool(query: str, all: bool = False) -> Dict[str, Any]:
         for (s, q, c, summ, snip) in hits]}
 
 
+def ingest_tool(path: str) -> Dict[str, Any]:
+    """Store a durable digest of a file so you understand it without re-reading. Cheap on repeat calls (cached by content), slow the first time on a large file. Refuses very large files — the user runs /ingest for those."""
+    run_ingest = _active_ingest[0]
+    if run_ingest is None:
+        return {"error": "ingest_unavailable",
+                "hint": "no active session; use read_file instead."}
+    return run_ingest(path)
+
+
+# Advertised by default: the model should reach for this to learn a file once
+# instead of paging it every session. /low-vram and /tools off ingest drop it.
+ingest_tool.model_facing = True
+
+
 TOOL_REGISTRY = {**CORE_TOOLS,
                  "recall": recall_tool,
+                 "ingest": ingest_tool,
                  **load_plugins(Path(__file__).resolve().parent / "tools")}
 
 
@@ -1875,8 +1893,15 @@ def _file_hash(path: str) -> str:
     return h.hexdigest()
 
 
-def ingest_file(path: str, model: str, store, layers_ref: list, cfg: dict) -> dict:
-    """Map-reduce a file into one cached, capped digest. Never raises."""
+def ingest_file(path: str, model: str, store, layers_ref: list, cfg: dict,
+                max_chunks: "Optional[int]" = None) -> dict:
+    """Map-reduce a file into one cached, capped digest. Never raises.
+
+    max_chunks bounds the work a single call can spend: over the cap the file is
+    refused before any model call. The human /ingest passes None (uncapped); the
+    model-facing ingest_tool passes a cap so the model cannot trigger dozens of
+    summarize calls on one huge file.
+    """
     abspath = resolve_abs_path(path)
     try:
         with open(abspath, "r", encoding="utf-8") as fh:
@@ -1895,6 +1920,10 @@ def ingest_file(path: str, model: str, store, layers_ref: list, cfg: dict) -> di
                 "cached": True}
 
     chunks = _chunk_lines(lines, size=200, overlap=20)
+    if max_chunks and len(chunks) > max_chunks:
+        return {"error": "too_large", "path": key,
+                "hint": f"{len(chunks)} chunks (> {max_chunks}); "
+                        f"run /ingest {path} manually to digest it."}
     num_ctx = cfg.get("num_ctx")
     token_budget = cfg.get("token_budget", TOKEN_BUDGET)
     chunk_summaries = []
@@ -2086,6 +2115,12 @@ def run(model: str, gpu_layers: Optional[int] = None,
     # Recall: expose the live store to recall_tool, and advertise it only when
     # there is prior history to search — a fresh DB pays nothing per turn.
     _active_store[0] = store
+    # ingest_tool reaches the live model/store/layers/cfg through this closure.
+    # Late binding on `model` means it follows /model switches. The 15-chunk cap
+    # keeps a single model-triggered ingest from spawning dozens of summarize
+    # calls; the human /ingest command stays uncapped.
+    _active_ingest[0] = lambda p: ingest_file(p, model, store, layers_ref, cfg,
+                                              max_chunks=15)
     if store.has_prior_history():
         _active_tools.add("recall")
     else:

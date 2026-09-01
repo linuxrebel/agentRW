@@ -438,6 +438,41 @@ def test_ingested_digest_is_recallable():
         print("  ingested digest is recallable                  ok")
 
 
+def test_ingest_tool_is_advertised_and_bridged():
+    assert getattr(ca.ingest_tool, "model_facing", False) is True, "should be advertised"
+    assert ca.TOOL_REGISTRY.get("ingest") is ca.ingest_tool, "must be registered"
+    # no active session -> graceful refuse, not a crash
+    ca._active_ingest[0] = None
+    r = ca.ingest_tool("whatever.py")
+    assert r.get("error") == "ingest_unavailable", r
+    # bridged: the tool returns whatever the live closure produces
+    ca._active_ingest[0] = lambda p: {"path": p, "digest": "D", "cached": False}
+    try:
+        assert ca.ingest_tool("x.py")["digest"] == "D"
+    finally:
+        ca._active_ingest[0] = None
+    print("  ingest_tool advertised + bridged               ok")
+
+
+def test_ingest_max_chunks_guard_trips_before_model():
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "huge.py"
+        f.write_text("".join(f"line {i}\n" for i in range(3200)))  # >15 chunks
+        store = ca.SessionStore(Path(d) / "s.db", model="m", cwd=d)
+        def boom(*a, **k):
+            raise AssertionError("model must not be called when over the cap")
+        orig = ca.call_llm
+        ca.call_llm = boom
+        try:
+            res = ca.ingest_file(str(f), "m", store, [None],
+                                 {"num_ctx": 2048, "token_budget": 2048}, max_chunks=15)
+            assert res.get("error") == "too_large", res
+        finally:
+            ca.call_llm = orig
+        assert store.find_digest(str(f), ca._file_hash(str(f))) is None, "nothing persisted"
+        print("  ingest max_chunks guard trips before model     ok")
+
+
 def test_no_think_sets_reasoning_effort():
     import types
     captured = {}
@@ -513,6 +548,8 @@ if __name__ == "__main__":
     test_ingest_refuses_missing_file()
     test_ingested_digest_is_recallable()
     test_reply_text_falls_back_to_reasoning()
+    test_ingest_tool_is_advertised_and_bridged()
+    test_ingest_max_chunks_guard_trips_before_model()
     test_no_think_sets_reasoning_effort()
     test_ingest_guards_empty_digest()
     print("all session-store tests passed")

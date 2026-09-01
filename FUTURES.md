@@ -167,3 +167,64 @@ Deferred with it:
 - **Update** — re-download, diff against installed, require an explicit enable.
 - **Signature verification.** Only meaningful with a key distribution story,
   which means a registry. Not now.
+
+---
+
+## Local memory: routing index + write arbitration (OzBrain pattern)
+
+**Proposed 2026-08-22. Not started.**
+
+Evaluated [ozbrain.com](https://ozbrain.com/) — a hosted, multi-tenant MCP
+knowledge base implementing Karpathy's agent-maintained-wiki pattern
+(https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f). The
+hosting model (Postgres + RLS, per-account encryption, connector auth,
+$0–$99/mo tiers) is irrelevant to a single-user home lab. The *retrieval and
+write-arbitration mechanism* is not — it is a direct answer to the problem a
+small local model (gemma4 on Bairn) actually has: a context window too small
+to hold everything it needs to know, and no discipline for what goes in when
+it writes something back.
+
+`repo-browser` (SQLite FTS5 + `nomic-embed-text` embeddings) already does
+semantic retrieval across 400+ repos. What it does not do is the four things
+OzBrain adds on top of retrieval:
+
+1. **Routing index over raw dump.** A small, always-loaded index — article
+   name, one-line description, freshness tag — read first, before pulling any
+   full article. This is the actual fix for small-context-window pain, more
+   than the storage/embedding backend. Right now `repo-browser` relies purely
+   on embedding search per query; there is no persistent top-level index the
+   model reads before deciding what to pull.
+2. **Size discipline at write time.** Cap article/note size; when a note grows
+   past a threshold, split and re-link automatically. Never make gemma4 read
+   one giant markdown file — same principle as "shrink the residue" in the
+   detector table above, applied to memory instead of lint findings.
+3. **Freshness tags.** Cheap metadata (`fresh` / `aging`) forcing a recheck
+   instead of silently trusting stale content. Trivial to add: a
+   last-verified timestamp per note, surfaced in the index.
+4. **Conflict-on-write.** New info that contradicts existing canon pauses for
+   review instead of silently overwriting. This is the one piece with real
+   cost — it requires a model call to compare new content against canon
+   before committing the write, which is exactly the kind of overhead a 7B
+   model on Bairn feels. Worth prototyping as a category-1 detector rather
+   than a full model judgement call: cheap heuristic diff/contradiction check
+   first, model escalation only when the heuristic is ambiguous — same
+   division of labor as the deterministic-detectors table above (offload to
+   a tool wherever possible, model only for what genuinely needs judgement).
+
+**Provenance per write** (which agent, when) is the cheap fifth item — useful
+once more than one local agent (browser-use, Ollama-fs, StudySkills,
+job-application-package) writes to the same store. Low cost, add alongside
+freshness tags.
+
+**Explicitly not adopting:** the hosting/tenancy layer, the SaaS billing
+model, or OzBrain itself as a dependency. The site's own "copy this prompt"
+onboarding block is itself worth noting as a pattern to avoid replicating
+uncritically — it's written to be pasted into an agent as instructions,
+which is a reasonable UX choice for their product but not something to
+import into `agentRW`'s design without scrutiny.
+
+**Where this plugs in:** most naturally as a `memory`-shaped plugin on top of
+`repo-browser`'s existing SQLite/embedding layer, or as a `ctx`-level
+primitive (`ctx.memory.query` / `ctx.memory.write`) once `ctx.ask` and the
+namespacing split above land — same "declare, don't reach past ctx" model as
+everything else in this file.

@@ -146,6 +146,7 @@ client = OpenAI(
 # Path utils
 # -----------------------------
 _agent_cwd = [Path.cwd()]  # mutable so tools always pick up current value
+_active_store = [None]      # set by run(); lets recall_tool reach the live store
 
 # Extra directories the model may write to, beyond the working directory.
 # Added with --allow-write. Reads are never restricted.
@@ -694,7 +695,20 @@ def load_plugins(d: Path) -> Dict[str, Any]:
 # Kept: the old name is what the tests and any external caller use.
 load_plugin_tools = load_plugins
 
+def recall_tool(query: str, all: bool = False) -> Dict[str, Any]:
+    """Search past sessions for prior context. all=True searches every directory."""
+    store = _active_store[0]
+    if store is None:
+        return {"matches": []}
+    scope = None if all else str(_agent_cwd[0])
+    hits = store.search(query, cwd=scope, k=4)
+    return {"matches": [
+        {"session": s, "seq": q, "cwd": c, "summary": summ, "snippet": snip}
+        for (s, q, c, summ, snip) in hits]}
+
+
 TOOL_REGISTRY = {**CORE_TOOLS,
+                 "recall": recall_tool,
                  **load_plugins(Path(__file__).resolve().parent / "tools")}
 
 
@@ -1858,8 +1872,21 @@ def run(model: str, gpu_layers: Optional[int] = None,
     store = SessionStore(SESSION_DB, model=model, cwd=str(_agent_cwd[0]))
     seq = [0]     # list so the nested helper can bump it
 
+    # Recall: expose the live store to recall_tool, and advertise it only when
+    # there is prior history to search — a fresh DB pays nothing per turn.
+    _active_store[0] = store
+    if store.has_prior_history():
+        _active_tools.add("recall")
+    else:
+        _active_tools.discard("recall")
+    messages[0] = {"role": "system", "content": build_prompt()}
+    _n_here = store.prior_sessions_for_cwd(str(_agent_cwd[0]))
+    if _n_here:
+        print(f"[Recall] {_n_here} past session(s) here. "
+              f"/recall <topic> to pull, or I'll check when unsure.")
+
     def remember(role: str, content: str, summary: str = "",
-                 pinned: bool = False) -> dict:
+                 pinned: bool = False, no_index: bool = False) -> dict:
         """Add a message to the window and to disk in one step.
 
         Every message goes to SQLite before it can be folded out of the window,
@@ -1873,7 +1900,7 @@ def run(model: str, gpu_layers: Optional[int] = None,
         if pinned:
             m["pinned"] = True
         messages.append(m)
-        store.add(seq[0], role, content, summary)
+        store.add(seq[0], role, content, summary, no_index=no_index)
         return m
 
     def goal_is_set() -> bool:
@@ -2371,7 +2398,8 @@ def run(model: str, gpu_layers: Optional[int] = None,
                 remember("user",
                          _cap_tool_result(f"tool_result({json.dumps(result)})",
                                           cfg["token_budget"]),
-                         summary=f"{name}: {_summarise_result(name, result)}")
+                         summary=f"{name}: {_summarise_result(name, result)}",
+                         no_index=(name == "read_file"))
 
             if turn_had_error:
                 consecutive_errors += 1

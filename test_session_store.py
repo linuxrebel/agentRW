@@ -289,6 +289,46 @@ def test_do_recall_respects_all_flag():
         print("  do_recall honors cwd default and --all          ok")
 
 
+def test_recall_tool_returns_matches_dict():
+    with tempfile.TemporaryDirectory() as d:
+        store = ca.SessionStore(Path(d) / "s.db", model="test", cwd="/proj/a")
+        if not store.fts:
+            print("  (fts5 unavailable — skipping recall_tool test)  ok")
+            return
+        cur = store.session_id
+        store.db.execute("INSERT INTO sessions (id, started, model, cwd) "
+                         "VALUES (70,'t','m','/proj/a')")
+        _seed(store, [(70, 1, "user", "kafka consumer lag spike", "lag", False)])
+        store.session_id = cur
+        ca._active_store[0] = store
+        ca._agent_cwd[0] = Path("/proj/a")
+        res = ca.recall_tool("kafka lag")
+        assert isinstance(res, dict) and res.get("matches"), res
+        assert res["matches"][0]["session"] == 70
+        assert "recall" in ca.TOOL_REGISTRY, "recall must be dispatchable"
+        assert "recall" not in ca._active_tools, "recall must be off by default"
+        ca._active_store[0] = None
+        print("  recall_tool returns matches; off by default     ok")
+
+
+def test_read_file_results_are_not_indexed():
+    with tempfile.TemporaryDirectory() as d:
+        store = ca.SessionStore(Path(d) / "s.db", model="test", cwd="/proj/a")
+        if not store.fts:
+            print("  (fts5 unavailable — skipping read_file test)    ok")
+            return
+        cur = store.session_id
+        store.session_id = 80
+        store.add(1, "user", 'tool_result({"content": "def zzqmarker(): pass"})',
+                  summary="read_file: 200 lines", no_index=True)
+        store.add(2, "user", "we should refactor zzqmarker next", "note", no_index=False)
+        store.session_id = cur
+        hits = store.search("zzqmarker", cwd=None, k=4)
+        assert hits, "the discussion message should be found"
+        assert all(h[1] != 1 for h in hits), "read_file page must be excluded"
+        print("  read_file results are not recalled              ok")
+
+
 if __name__ == "__main__":
     test_errors_are_slugs_not_prose()
     test_search_reports_what_it_cut()
@@ -304,4 +344,6 @@ if __name__ == "__main__":
     test_history_flags()
     test_format_recall_renders_and_caps()
     test_do_recall_respects_all_flag()
+    test_recall_tool_returns_matches_dict()
+    test_read_file_results_are_not_indexed()
     print("all session-store tests passed")

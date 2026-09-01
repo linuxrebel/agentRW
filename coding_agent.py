@@ -1504,13 +1504,26 @@ def _reply_text(msg) -> str:
     calls = getattr(msg, "tool_calls", None)
     if calls:
         return "\n".join(f"{c.function.name}({c.function.arguments})" for c in calls)
-    return msg.content or ""
+    content = msg.content or ""
+    if content.strip():
+        return content
+    # Reasoning models (qwen3, deepseek-r1, …) spend the token budget on hidden
+    # thinking and leave content empty when they hit the limit before answering
+    # — finish_reason="length". Ollama exposes that thinking as .reasoning. When
+    # content is blank, surface the reasoning rather than returning "" and ending
+    # the turn on a silent blank (the failure behind "the model just goes blank
+    # when it runs out of room").
+    for attr in ("reasoning", "reasoning_content"):
+        r = getattr(msg, attr, None)
+        if r and r.strip():
+            return r
+    return content
 
 
 def call_llm(model: str, messages: list, gpu_layers: "Optional[List[Optional[int]]]" = None,
              max_tokens: int = 2000, num_ctx: Optional[int] = None,
              token_budget: int = TOKEN_BUDGET, send_tools: bool = True,
-             store: "Optional[SessionStore]" = None) -> str:
+             store: "Optional[SessionStore]" = None, no_think: bool = False) -> str:
     budget = token_budget
     trimmed = proactive_trim(messages, budget_tokens=budget, store=store)
     if trimmed:
@@ -1530,6 +1543,14 @@ def call_llm(model: str, messages: list, gpu_layers: "Optional[List[Optional[int
             kw: Dict[str, Any] = {}
             if send_tools:
                 kw["tools"] = _tools_schema()
+            if no_think:
+                # Ollama honours OpenAI's reasoning_effort; "none" turns off the
+                # hidden thinking pass on reasoning models (qwen3, r1, …) so they
+                # answer directly. Without it a tight max_tokens is spent entirely
+                # on thinking and the reply comes back empty. Non-reasoning models
+                # accept and ignore it. Used by one-shot calls (ingest) that want
+                # the answer, not the scratchpad.
+                kw["reasoning_effort"] = "none"
             r = client.chat.completions.create(
                 model=model,
                 messages=working,
@@ -1882,9 +1903,13 @@ def ingest_file(path: str, model: str, store, layers_ref: list, cfg: dict) -> di
             print(f"[Ingest] summarizing chunk {i + 1}/{len(chunks)}…")
             msgs = [{"role": "system", "content": INGEST_MAP_PROMPT},
                     {"role": "user", "content": f"Lines {sl}-{el}:\n{text}"}]
-            summary = call_llm(model, msgs, gpu_layers=layers_ref, max_tokens=150,
+            # no_think: a reasoning model would otherwise spend the whole cap on
+            # hidden thinking and return an empty summary. 400 leaves room for a
+            # dense chunk if a model ignores the flag; the empty-digest guard and
+            # reasoning fallback below are the backstop.
+            summary = call_llm(model, msgs, gpu_layers=layers_ref, max_tokens=400,
                                num_ctx=num_ctx, token_budget=token_budget,
-                               send_tools=False) or ""
+                               send_tools=False, no_think=True) or ""
             chunk_summaries.append((i, sl, el, summary.strip()))
 
         if len(chunk_summaries) == 1:
@@ -1894,12 +1919,18 @@ def ingest_file(path: str, model: str, store, layers_ref: list, cfg: dict) -> di
             print("[Ingest] reducing to file digest…")
             msgs = [{"role": "system", "content": INGEST_REDUCE_PROMPT},
                     {"role": "user", "content": joined}]
-            digest = (call_llm(model, msgs, gpu_layers=layers_ref, max_tokens=300,
+            digest = (call_llm(model, msgs, gpu_layers=layers_ref, max_tokens=512,
                                num_ctx=num_ctx, token_budget=token_budget,
-                               send_tools=False) or "").strip()
+                               send_tools=False, no_think=True) or "").strip()
     except Exception as e:  # any call_llm failure aborts the whole run
         return {"error": "ingest_failed", "path": key, "hint": str(e)}
 
+    if not digest.strip():
+        # Never persist a blank digest — a cache hit on nothing is worse than a
+        # miss. Happens when the model returns no usable text at all.
+        return {"error": "empty_digest", "path": key,
+                "hint": "the model produced no digest; try a larger or "
+                        "non-reasoning model, or a bigger context window."}
     digest = _cap_tool_result(digest, token_budget)
     store.save_digest(key, str(_agent_cwd[0]), content_hash, len(lines),
                       len(chunks), digest, model, chunk_summaries)

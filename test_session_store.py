@@ -438,6 +438,57 @@ def test_ingested_digest_is_recallable():
         print("  ingested digest is recallable                  ok")
 
 
+def test_no_think_sets_reasoning_effort():
+    import types
+    captured = {}
+    def fake_create(**kw):
+        captured.update(kw)
+        msg = types.SimpleNamespace(tool_calls=None, content="ok", reasoning=None)
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
+    orig = ca.client.chat.completions.create
+    ca.client.chat.completions.create = fake_create
+    try:
+        ca.call_llm("m", [{"role": "user", "content": "hi"}], send_tools=False, no_think=True)
+        assert captured.get("reasoning_effort") == "none", "no_think must disable reasoning"
+        captured.clear()
+        ca.call_llm("m", [{"role": "user", "content": "hi"}], send_tools=False)
+        assert "reasoning_effort" not in captured, "default must not set reasoning_effort"
+    finally:
+        ca.client.chat.completions.create = orig
+    print("  no_think passes reasoning_effort=none           ok")
+
+
+def test_reply_text_falls_back_to_reasoning():
+    import types
+    # content empty (reasoning model hit the length limit before answering)
+    msg = types.SimpleNamespace(tool_calls=None, content="", reasoning="I think X")
+    assert ca._reply_text(msg) == "I think X", "empty content should fall back to reasoning"
+    # normal content wins over reasoning
+    msg2 = types.SimpleNamespace(tool_calls=None, content="real answer", reasoning="scratch")
+    assert ca._reply_text(msg2) == "real answer"
+    # nothing anywhere -> empty string, not a crash
+    msg3 = types.SimpleNamespace(tool_calls=None, content="", reasoning=None)
+    assert ca._reply_text(msg3) == ""
+    print("  reply_text falls back to reasoning on blank     ok")
+
+
+def test_ingest_guards_empty_digest():
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "big.py"
+        f.write_text("".join(f"line {i}\n" for i in range(1, 351)))
+        store = ca.SessionStore(Path(d) / "s.db", model="m", cwd=d)
+        orig = ca.call_llm
+        ca.call_llm = lambda *a, **k: ""      # model returns nothing usable
+        try:
+            res = ca.ingest_file(str(f), "m", store, [None],
+                                 {"num_ctx": 2048, "token_budget": 2048})
+            assert res.get("error") == "empty_digest", res
+        finally:
+            ca.call_llm = orig
+        assert store.find_digest(str(f), ca._file_hash(str(f))) is None, "blank must not persist"
+        print("  ingest refuses to persist an empty digest      ok")
+
+
 if __name__ == "__main__":
     test_errors_are_slugs_not_prose()
     test_search_reports_what_it_cut()
@@ -461,4 +512,7 @@ if __name__ == "__main__":
     test_ingest_aborts_atomically_on_llm_failure()
     test_ingest_refuses_missing_file()
     test_ingested_digest_is_recallable()
+    test_reply_text_falls_back_to_reasoning()
+    test_no_think_sets_reasoning_effort()
+    test_ingest_guards_empty_digest()
     print("all session-store tests passed")

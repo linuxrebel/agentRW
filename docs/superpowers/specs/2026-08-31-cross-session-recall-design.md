@@ -53,6 +53,13 @@ Give agentRW cross-session recall that:
    `messages.id` as rowid, stores no duplicate text) kept in sync by triggers.
    Index both `content` and `summary`. Auto-backfill once from pre-existing
    rows. Fall back cleanly if the sqlite build lacks FTS5.
+6. **Exclude raw file-page dumps from the index.** `read_file` pages a file 200
+   lines at a time (`read_file_tool`), so learning one large file writes
+   hundreds of message rows. Indexed raw, they flood recall and drown out
+   dialogue (`/recall "auth bug"` returning twelve chunks of `jquery.js`).
+   File-page tool results are therefore **not indexed** — recall favors
+   dialogue and summaries. The distilled way to recall a large file is the
+   separate **ingest** feature, not raw pages.
 
 ## Components
 
@@ -85,8 +92,16 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
 END;
 ```
 
-Because sync is via triggers, `SessionStore.add()` needs **no** change — the
-`folded` UPDATE and any future edits stay indexed automatically.
+To exclude raw file-page dumps (Decision 6), add a `no_index INTEGER NOT NULL
+DEFAULT 0` column to `messages` and guard the triggers:
+`... AFTER INSERT ON messages WHEN new.no_index = 0 BEGIN ...` (and the same
+`WHEN old.no_index = 0` on the delete/update triggers). `SessionStore.add()`
+gains a `no_index=False` parameter; the main loop sets it `True` when storing a
+`read_file` tool result. A fully-skipped row simply never enters the FTS table
+(its thin auto-summary is not worth indexing on its own).
+
+Aside from that one flag, sync is via triggers, so the `folded` UPDATE and any
+future edits stay indexed automatically.
 
 ### 2. `SessionStore._ensure_fts()` (called from `__init__`)
 
@@ -185,6 +200,7 @@ matching existing style):
 - cwd scope filters to the current directory by default.
 - `--all` / `all=True` returns matches across directories.
 - Backfill populates `messages_fts` from rows inserted before the index existed.
+- A `no_index=True` message never appears in `search()` results.
 - FTS5-absent path (simulated) returns the same tuple shape via `LIKE`.
 - `format_recall` output is capped (never exceeds the tool-result slice).
 

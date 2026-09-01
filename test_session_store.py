@@ -329,6 +329,115 @@ def test_read_file_results_are_not_indexed():
         print("  read_file results are not recalled              ok")
 
 
+def test_digest_roundtrip_and_cache():
+    with tempfile.TemporaryDirectory() as d:
+        store = ca.SessionStore(Path(d) / "s.db", model="m", cwd="/proj/a")
+        did = store.save_digest(
+            "/proj/a/big.py", "/proj/a", "hash1", lines=350, n_chunks=2,
+            digest="does X and Y", model="m",
+            chunk_summaries=[(0, 1, 200, "part one"), (1, 181, 350, "part two")])
+        assert did, "save_digest should return an id"
+        hit = store.find_digest("/proj/a/big.py", "hash1")
+        assert hit and hit["digest"] == "does X and Y"
+        assert hit["n_chunks"] == 2
+        assert store.find_digest("/proj/a/big.py", "hash2") is None, "changed hash = miss"
+        chunks = store.chunks_for("/proj/a/big.py")
+        assert [c[0] for c in chunks] == [0, 1]
+        assert chunks[1][3] == "part two"
+        print("  digest round-trip + hash cache                 ok")
+
+
+def test_chunker_windows_and_overlap():
+    lines = [f"line {i}\n" for i in range(1, 351)]   # 350 lines
+    chunks = ca._chunk_lines(lines, size=200, overlap=20)
+    # windows advance by 180: [1..200], [181..350]
+    assert len(chunks) == 2, f"expected 2 chunks, got {len(chunks)}"
+    assert chunks[0][0] == 1 and chunks[0][1] == 200
+    assert chunks[1][0] == 181 and chunks[1][1] == 350
+    assert chunks[0][2].startswith("line 1\n")
+    # small file -> exactly one chunk, no reduce needed downstream
+    small = ca._chunk_lines([f"l{i}\n" for i in range(50)], size=200, overlap=20)
+    assert len(small) == 1 and small[0][0] == 1 and small[0][1] == 50
+    print("  chunker windows + overlap + single-chunk       ok")
+
+
+def test_ingest_file_maps_reduces_and_caches():
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "big.py"
+        f.write_text("".join(f"line {i}\n" for i in range(1, 351)))  # 2 chunks
+        store = ca.SessionStore(Path(d) / "s.db", model="m", cwd=d)
+        calls = {"n": 0}
+        def fake_llm(model, messages, **kw):
+            calls["n"] += 1
+            return f"summary {calls['n']}"
+        orig = ca.call_llm
+        ca.call_llm = fake_llm
+        try:
+            res = ca.ingest_file(str(f), "m", store, [None], {"num_ctx": 2048, "token_budget": 2048})
+            assert res.get("digest"), res
+            assert res["n_chunks"] == 2 and res["cached"] is False
+            assert calls["n"] == 3, "2 map calls + 1 reduce"
+            row = store.find_digest(str(f), ca._file_hash(str(f)))
+            assert row and row["digest"] == res["digest"]
+            assert len(store.chunks_for(str(f))) == 2
+            # second run hits cache: no new call_llm
+            before = calls["n"]
+            res2 = ca.ingest_file(str(f), "m", store, [None], {"num_ctx": 2048, "token_budget": 2048})
+            assert res2["cached"] is True and calls["n"] == before
+        finally:
+            ca.call_llm = orig
+        print("  ingest maps, reduces, caches                   ok")
+
+
+def test_ingest_aborts_atomically_on_llm_failure():
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "big.py"
+        f.write_text("".join(f"line {i}\n" for i in range(1, 351)))
+        store = ca.SessionStore(Path(d) / "s.db", model="m", cwd=d)
+        def boom(*a, **k):
+            raise RuntimeError("ollama down")
+        orig = ca.call_llm
+        ca.call_llm = boom
+        try:
+            res = ca.ingest_file(str(f), "m", store, [None], {"num_ctx": 2048, "token_budget": 2048})
+            assert "error" in res, "should return an error dict"
+        finally:
+            ca.call_llm = orig
+        assert store.find_digest(str(f), ca._file_hash(str(f))) is None, "nothing persisted"
+        print("  ingest aborts atomically on llm failure        ok")
+
+
+def test_ingest_refuses_missing_file():
+    with tempfile.TemporaryDirectory() as d:
+        store = ca.SessionStore(Path(d) / "s.db", model="m", cwd=d)
+        res = ca.ingest_file(str(Path(d) / "nope.py"), "m", store, [None],
+                             {"num_ctx": 2048, "token_budget": 2048})
+        assert res.get("error"), res
+        assert "hint" in res
+        print("  ingest refuses a missing file                  ok")
+
+
+def test_ingested_digest_is_recallable():
+    with tempfile.TemporaryDirectory() as d:
+        store = ca.SessionStore(Path(d) / "s.db", model="m", cwd="/proj/a")
+        if not store.fts:
+            print("  (fts5 unavailable — skipping recall tie test)  ok")
+            return
+        cur = store.session_id
+        store.session_id = 90
+        # what /ingest injects (foldable, indexed):
+        store.add(1, "user", "[ingest] parser.py — tokenizes and builds the AST",
+                  summary="ingest: parser.py", no_index=False)
+        # a raw page dump must never be recalled:
+        store.add(2, "user", 'tool_result({"content":"astzzq internals"})',
+                  summary="read_file", no_index=True)
+        store.session_id = cur
+        hits = store.search("AST", cwd=None, k=4)
+        assert hits, "digest should be recallable"
+        assert all(h[1] != 2 for h in hits), "raw page must not be recalled"
+        print("  ingested digest is recallable                  ok")
+
+
 if __name__ == "__main__":
     test_errors_are_slugs_not_prose()
     test_search_reports_what_it_cut()
@@ -346,4 +455,10 @@ if __name__ == "__main__":
     test_do_recall_respects_all_flag()
     test_recall_tool_returns_matches_dict()
     test_read_file_results_are_not_indexed()
+    test_digest_roundtrip_and_cache()
+    test_chunker_windows_and_overlap()
+    test_ingest_file_maps_reduces_and_caches()
+    test_ingest_aborts_atomically_on_llm_failure()
+    test_ingest_refuses_missing_file()
+    test_ingested_digest_is_recallable()
     print("all session-store tests passed")

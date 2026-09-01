@@ -8,6 +8,7 @@ if sys.version_info < (3, 9):
 
 import ast
 import concurrent.futures
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -118,6 +119,7 @@ RESET_COLOR     = "\033[0m"  if _ANSI else ""
 
 SLASH_COMMANDS = (
     "/help", "/model", "/gpu-layers", "/low-vram", "/compact", "/tokens", "/recall",
+    "/ingest",
     "/reset", "/pwd", "/plugins", "/tools", "/ops", "/olist", "/cloud-models", "/update",
     "/save",
     "/bye", "cd <path>",
@@ -264,6 +266,28 @@ def read_file_tool(
         "has_more": end < total,
         "content": "".join(lines[start:end]),
     }
+
+
+def _chunk_lines(lines: list, size: int = 200, overlap: int = 20) -> list:
+    """Split lines into overlapping windows: [(start_line, end_line, text), ...].
+
+    Line numbers are 1-based inclusive. Windows advance by size - overlap so a
+    function split across a boundary survives in the next chunk. A file of
+    `size` lines or fewer is one chunk (the caller then skips the reduce step).
+    """
+    total = len(lines)
+    if total <= size:
+        return [(1, total, "".join(lines))] if total else [(1, 0, "")]
+    step = max(size - overlap, 1)
+    out = []
+    start = 0
+    while start < total:
+        end = min(start + size, total)
+        out.append((start + 1, end, "".join(lines[start:end])))
+        if end == total:
+            break
+        start += step
+    return out
 
 
 MAX_LISTED_ENTRIES = 40   # names returned before the rest becomes a count
@@ -985,6 +1009,26 @@ CREATE TABLE IF NOT EXISTS artifacts (
     saved      TEXT NOT NULL,
     path       TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS file_digests (
+    id           INTEGER PRIMARY KEY,
+    path         TEXT NOT NULL,
+    cwd          TEXT,
+    content_hash TEXT NOT NULL,
+    lines        INTEGER,
+    n_chunks     INTEGER,
+    digest       TEXT NOT NULL,
+    model        TEXT,
+    created      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS file_digests_path ON file_digests(path, content_hash);
+CREATE TABLE IF NOT EXISTS file_chunks (
+    digest_id  INTEGER NOT NULL,
+    chunk_no   INTEGER NOT NULL,
+    start_line INTEGER,
+    end_line   INTEGER,
+    summary    TEXT,
+    PRIMARY KEY (digest_id, chunk_no)
+);
 """
 
 
@@ -1214,6 +1258,69 @@ class SessionStore:
             return (row[0], row[1])
         except sqlite3.Error:
             return (0, 0)
+
+    def find_digest(self, path: str, content_hash: str) -> "Optional[dict]":
+        """Cached digest for this exact file content, or None."""
+        if not self.live:
+            return None
+        try:
+            row = self.db.execute(
+                "SELECT id, path, cwd, content_hash, lines, n_chunks, digest, "
+                "model, created FROM file_digests "
+                "WHERE path=? AND content_hash=? ORDER BY id DESC LIMIT 1",
+                (path, content_hash)).fetchone()
+        except sqlite3.Error:
+            return None
+        if not row:
+            return None
+        keys = ("id", "path", "cwd", "content_hash", "lines", "n_chunks",
+                "digest", "model", "created")
+        return dict(zip(keys, row))
+
+    def save_digest(self, path: str, cwd: str, content_hash: str, lines: int,
+                    n_chunks: int, digest: str, model: str,
+                    chunk_summaries: list) -> "Optional[int]":
+        """Insert one file_digests row + its file_chunks in one transaction.
+
+        Atomic: a failure part-way rolls back, so a cache lookup never finds a
+        digest whose chunks are missing.
+        """
+        if not self.live:
+            return None
+        try:
+            cur = self.db.execute(
+                "INSERT INTO file_digests "
+                "(path, cwd, content_hash, lines, n_chunks, digest, model, created) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (path, cwd, content_hash, lines, n_chunks, digest, model,
+                 datetime.now().isoformat(timespec="seconds")))
+            digest_id = cur.lastrowid
+            self.db.executemany(
+                "INSERT INTO file_chunks "
+                "(digest_id, chunk_no, start_line, end_line, summary) "
+                "VALUES (?,?,?,?,?)",
+                [(digest_id, cn, sl, el, s) for (cn, sl, el, s) in chunk_summaries])
+            self.db.commit()
+            return digest_id
+        except sqlite3.Error:
+            self.db.rollback()
+            return None
+
+    def chunks_for(self, path: str) -> list:
+        """Chunks of the newest digest for path: (chunk_no, start, end, summary)."""
+        if not self.live:
+            return []
+        try:
+            row = self.db.execute(
+                "SELECT id FROM file_digests WHERE path=? ORDER BY id DESC LIMIT 1",
+                (path,)).fetchone()
+            if not row:
+                return []
+            return list(self.db.execute(
+                "SELECT chunk_no, start_line, end_line, summary FROM file_chunks "
+                "WHERE digest_id=? ORDER BY chunk_no", (row[0],)))
+        except sqlite3.Error:
+            return []
 
 
 # -----------------------------
@@ -1727,6 +1834,79 @@ def _propose_or_compute(model: str, cfg: dict, layers_ref: list,
     return _propose_fix(model, cfg, layers_ref, lines, finding)
 
 
+INGEST_MAP_PROMPT = (
+    "You summarize a slice of a source file for a durable index. In 2-3 "
+    "sentences, say what this slice defines and does. Name key functions, "
+    "classes, and side effects. No preamble, no code fences.")
+
+INGEST_REDUCE_PROMPT = (
+    "You are given per-slice summaries of one file, in order. Write a single "
+    "digest of the whole file in at most 200 words: its purpose, its main "
+    "components, and how they fit. No preamble, no code fences.")
+
+
+def _file_hash(path: str) -> str:
+    """sha256 of the file's bytes. Content-addressed staleness."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(65536), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def ingest_file(path: str, model: str, store, layers_ref: list, cfg: dict) -> dict:
+    """Map-reduce a file into one cached, capped digest. Never raises."""
+    abspath = resolve_abs_path(path)
+    try:
+        with open(abspath, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError as e:
+        return _fs_error(e, abspath)
+    except UnicodeDecodeError as e:
+        return _fs_error(e, abspath)
+
+    key = str(abspath)
+    content_hash = _file_hash(key)
+    cached = store.find_digest(key, content_hash)
+    if cached:
+        return {"path": key, "lines": cached["lines"],
+                "n_chunks": cached["n_chunks"], "digest": cached["digest"],
+                "cached": True}
+
+    chunks = _chunk_lines(lines, size=200, overlap=20)
+    num_ctx = cfg.get("num_ctx")
+    token_budget = cfg.get("token_budget", TOKEN_BUDGET)
+    chunk_summaries = []
+    try:
+        for i, (sl, el, text) in enumerate(chunks):
+            print(f"[Ingest] summarizing chunk {i + 1}/{len(chunks)}…")
+            msgs = [{"role": "system", "content": INGEST_MAP_PROMPT},
+                    {"role": "user", "content": f"Lines {sl}-{el}:\n{text}"}]
+            summary = call_llm(model, msgs, gpu_layers=layers_ref, max_tokens=150,
+                               num_ctx=num_ctx, token_budget=token_budget,
+                               send_tools=False) or ""
+            chunk_summaries.append((i, sl, el, summary.strip()))
+
+        if len(chunk_summaries) == 1:
+            digest = chunk_summaries[0][3]
+        else:
+            joined = "\n".join(f"[{sl}-{el}] {s}" for (_, sl, el, s) in chunk_summaries)
+            print("[Ingest] reducing to file digest…")
+            msgs = [{"role": "system", "content": INGEST_REDUCE_PROMPT},
+                    {"role": "user", "content": joined}]
+            digest = (call_llm(model, msgs, gpu_layers=layers_ref, max_tokens=300,
+                               num_ctx=num_ctx, token_budget=token_budget,
+                               send_tools=False) or "").strip()
+    except Exception as e:  # any call_llm failure aborts the whole run
+        return {"error": "ingest_failed", "path": key, "hint": str(e)}
+
+    digest = _cap_tool_result(digest, token_budget)
+    store.save_digest(key, str(_agent_cwd[0]), content_hash, len(lines),
+                      len(chunks), digest, model, chunk_summaries)
+    return {"path": key, "lines": len(lines), "n_chunks": len(chunks),
+            "digest": digest, "cached": False}
+
+
 def _apply_insert(lines: List[str], finding: Dict[str, Any], new: str) -> List[str]:
     """Insert `new` for an insert_top / insert_after finding.
 
@@ -1980,6 +2160,26 @@ def run(model: str, gpu_layers: Optional[int] = None,
                                all_scope=_all, budget_tokens=cfg["token_budget"])
             print(_block)
             remember("user", _block, summary=f"recall: {_rest[:60]}")
+            continue
+
+        if user.lower().startswith("/ingest"):
+            _ia = user.split(None, 1)
+            _ipath = _ia[1].strip() if len(_ia) > 1 else ""
+            if not _ipath:
+                print("[Ingest] usage: /ingest <path>")
+                continue
+            _res = ingest_file(_ipath, model, store, layers_ref, cfg)
+            if _res.get("error"):
+                print(f"[Ingest] {_res.get('hint', _res['error'])} "
+                      f"(use read_file to inspect it directly)")
+                continue
+            _tag = " (cached)" if _res.get("cached") else ""
+            _hdr = (f"[ingest] {_res['path']} · {_res['lines']} lines · "
+                    f"digest{_tag}")
+            print(_hdr)
+            print(_res["digest"])
+            remember("user", f"{_hdr}\n{_res['digest']}",
+                     summary=f"ingest: {Path(_res['path']).name}", no_index=False)
             continue
 
         if user.lower().startswith("/save"):

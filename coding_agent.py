@@ -117,7 +117,7 @@ ASSISTANT_COLOR = "\033[93m" if _ANSI else ""
 RESET_COLOR     = "\033[0m"  if _ANSI else ""
 
 SLASH_COMMANDS = (
-    "/help", "/model", "/gpu-layers", "/low-vram", "/compact", "/tokens",
+    "/help", "/model", "/gpu-layers", "/low-vram", "/compact", "/tokens", "/recall",
     "/reset", "/pwd", "/plugins", "/tools", "/ops", "/olist", "/cloud-models", "/update",
     "/save",
     "/bye", "cd <path>",
@@ -1232,6 +1232,24 @@ def _cap_tool_result(text: str, budget_tokens: int = TOKEN_BUDGET) -> str:
     return text[:cap] + note
 
 
+def format_recall(hits: list, budget_tokens: int = TOKEN_BUDGET) -> str:
+    """Render recall hits as a compact, capped block for the window."""
+    if not hits:
+        return "[recall] no matches."
+    lines = ["[recall] past-session matches:"]
+    for session_id, seq, cwd, summary, snippet in hits:
+        label = (summary or "").strip() or (snippet or "").strip()[:80]
+        lines.append(f"  [sess {session_id} #{seq}] {label} — \"…{snippet}…\"")
+    return _cap_tool_result("\n".join(lines), budget_tokens)
+
+
+def do_recall(store, cwd: str, query: str, all_scope: bool = False,
+              budget_tokens: int = TOKEN_BUDGET) -> str:
+    """Search past sessions and render a capped block. cwd default, --all global."""
+    scope = None if all_scope else cwd
+    return format_recall(store.search(query, cwd=scope, k=4), budget_tokens)
+
+
 KEEP_VERBATIM = 6      # most recent messages never folded
 FOLD_FLOOR = 120       # a message this small is not worth folding
 
@@ -1919,6 +1937,22 @@ def run(model: str, gpu_layers: Optional[int] = None,
             if store.live:
                 print(f"[Store]   {stored} messages on disk, {folded_n} folded "
                       f"out of the window and still recoverable.")
+            continue
+
+        if user.lower().startswith("/recall"):
+            _ra = user.split(None, 1)
+            _rest = _ra[1] if len(_ra) > 1 else ""
+            _all = False
+            if _rest.startswith("--all"):
+                _all = True
+                _rest = _rest[len("--all"):].strip()
+            if not _rest:
+                print("[Recall] usage: /recall [--all] <query>")
+                continue
+            _block = do_recall(store, str(_agent_cwd[0]), _rest,
+                               all_scope=_all, budget_tokens=cfg["token_budget"])
+            print(_block)
+            remember("user", _block, summary=f"recall: {_rest[:60]}")
             continue
 
         if user.lower().startswith("/save"):

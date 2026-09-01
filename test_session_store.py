@@ -258,6 +258,37 @@ def test_history_flags():
         print("  prior-history flags report correctly            ok")
 
 
+def test_format_recall_renders_and_caps():
+    assert "no matches" in ca.format_recall([]).lower()
+    hits = [(7, 3, "/proj/a", "auth bug", "token expiry …")]
+    out = ca.format_recall(hits)
+    assert "sess 7" in out and "#3" in out and "auth bug" in out
+    big = [(i, i, "/p", "s" * 500, "x" * 5000) for i in range(50)]
+    assert len(ca.format_recall(big, budget_tokens=2000)) < 2000 * ca._CHARS_PER_TOKEN
+    print("  recall output renders and stays capped          ok")
+
+
+def test_do_recall_respects_all_flag():
+    with tempfile.TemporaryDirectory() as d:
+        store = ca.SessionStore(Path(d) / "s.db", model="test", cwd="/proj/a")
+        if not store.fts:
+            print("  (fts5 unavailable — skipping do_recall test)    ok")
+            return
+        cur = store.session_id
+        store.db.execute("INSERT INTO sessions (id, started, model, cwd) "
+                         "VALUES (60,'t','m','/proj/a'),(61,'t','m','/proj/b')")
+        _seed(store, [
+            (60, 1, "user", "sqlite migration plan", "migration", False),
+            (61, 1, "user", "sqlite migration plan", "migration", False),
+        ])
+        store.session_id = cur
+        local = ca.do_recall(store, "/proj/a", "migration", all_scope=False)
+        assert "sess 60" in local and "sess 61" not in local, "cwd scope"
+        glob = ca.do_recall(store, "/proj/a", "migration", all_scope=True)
+        assert "sess 61" in glob, "--all should reach other cwds"
+        print("  do_recall honors cwd default and --all          ok")
+
+
 if __name__ == "__main__":
     test_errors_are_slugs_not_prose()
     test_search_reports_what_it_cut()
@@ -271,4 +302,6 @@ if __name__ == "__main__":
     test_no_index_rows_are_not_recalled()
     test_backfill_indexes_preexisting_rows()
     test_history_flags()
+    test_format_recall_renders_and_caps()
+    test_do_recall_respects_all_flag()
     print("all session-store tests passed")

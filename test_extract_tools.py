@@ -409,8 +409,21 @@ def test_advertising_defaults():
     assert {"plugin_default", "core_opted_out"} <= set(registry)
 
 
+def test_smalltalk_gate():
+    import coding_agent as ca
+    # Bare greetings/pleasantries drop tools for the turn.
+    for msg in ["hello", "Hi!", "  thanks  ", "how are you?", "Good morning",
+                "who are you", "ok", "HELLO THERE"]:
+        assert ca._is_smalltalk(msg), msg
+    # Anything naming a task or path keeps its tools.
+    for msg in ["hello, read /etc/hosts", "write a fib script", "hi there, run ls",
+                "fix the bug", "list files", "read foo.py", "thanks for the file"]:
+        assert not ca._is_smalltalk(msg), msg
+
+
 if __name__ == "__main__":
     test_extract_tools()
+    test_smalltalk_gate()
     test_advertising_defaults()
     test_native_tool_calls_are_read()
     test_command_aliases()

@@ -101,6 +101,34 @@ def _resolve_ambiguous(word: str, line: str) -> bool:
     return False
 
 
+# A tiny model given a task-first system prompt sometimes answers a greeting by
+# grabbing a tool — "hello" comes back as a written hello_world.py. On a plainly
+# social turn any tool call the model emits is ignored, so it can only talk back.
+# Deliberately conservative: only an (almost) bare greeting matches, so a real
+# request that merely opens with "hi" is not smalltalk and its tool calls run.
+# The asymmetry is the point — ignoring an actual task's tool call would break
+# the agent, so when in doubt it is not smalltalk.
+_SMALLTALK = frozenset({
+    "hi", "hello", "hey", "yo", "hiya", "howdy", "sup", "greetings",
+    "hello there", "hey there", "hi there",
+    "good morning", "good afternoon", "good evening", "good night", "gm", "gn",
+    "thanks", "thank you", "thx", "ty", "cheers", "no thanks",
+    "ok", "okay", "cool", "nice", "great", "bye", "goodbye",
+    "how are you", "who are you", "what are you", "what can you do",
+    "how do you work", "what is your name",
+})
+
+
+def _is_smalltalk(msg: str) -> bool:
+    """True when the whole message is a bare greeting/pleasantry, no task in it.
+
+    On such a turn the model's tool calls are ignored. Full-message match only,
+    so "hello, read foo.py" is NOT smalltalk — its tool calls still run.
+    """
+    norm = " ".join(msg.strip().lower().split()).rstrip(".!?,")
+    return norm in _SMALLTALK
+
+
 def _init_ansi() -> bool:
     """Enable ANSI color support. Returns True if colors are available."""
     if sys.platform != "win32":
@@ -2574,6 +2602,13 @@ def run(model: str, gpu_layers: Optional[int] = None,
         consecutive_errors = 0
         tool_calls_this_turn = 0
         MAX_TOOL_CALLS = 4
+        # A bare greeting is not a task: any tool call the model emits this turn
+        # is ignored, so a small model can't answer "hello" by writing a
+        # hello_world.py. The tool schema is still SENT — that is what gives the
+        # model a clean native "no tool" path (dropping it makes tiny models emit
+        # the call as text instead, which is worse). Path-bearing messages are
+        # never smalltalk, so tasks keep their tools live.
+        turn_is_smalltalk = _is_smalltalk(user)
         while True:
             print("\nThinking...")
 
@@ -2594,7 +2629,15 @@ def run(model: str, gpu_layers: Optional[int] = None,
                 messages.pop()
                 break
 
-            tools = extract_tools(reply)
+            if turn_is_smalltalk:
+                # Tools stay ignored this turn. If the model still tried one
+                # (tiny models answer "hello" with a write_file call), don't dump
+                # the raw call at the user — give a plain acknowledgement instead.
+                tools = []
+                if extract_tools(reply):
+                    reply = "Hi! Tell me what you'd like me to do."
+            else:
+                tools = extract_tools(reply)
 
             if not tools:
                 print(f"{ASSISTANT_COLOR}Assistant:{RESET_COLOR} {reply}")

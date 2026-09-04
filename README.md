@@ -85,8 +85,8 @@ Build a release tarball from a checkout:
 ### Linux / macOS — system-wide
 
 ```bash
-tar -xzf agentRW-1.2.9.tar.gz
-sudo ./agentRW-1.2.9/install.sh
+tar -xzf agentRW-1.5.0.tar.gz
+sudo ./agentRW-1.5.0/install.sh
 ```
 
 Needs root, because it writes to `/opt` and `/usr/local/bin`. Run it without
@@ -97,8 +97,8 @@ Needs root, because it writes to `/opt` and `/usr/local/bin`. Run it without
 In **PowerShell**:
 
 ```powershell
-tar -xzf agentRW-1.2.9.tar.gz
-.\agentRW-1.2.9\install.bat
+tar -xzf agentRW-1.5.0.tar.gz
+.\agentRW-1.5.0\install.bat
 ```
 
 Installs under `%LOCALAPPDATA%`, so no administrator rights are needed.

@@ -349,15 +349,23 @@ def list_files_tool(path: str, pattern: str = "") -> Dict[str, Any]:
         # one character instead of a "type" field per entry.
         names = []
         dirs = files = total = 0
-        for x in sorted(p.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
+        # os.scandir caches is_dir()/is_symlink() per entry (and gets the type
+        # from the directory read itself where the OS supplies it), so each
+        # entry costs at most one stat instead of the three Path.iterdir drove
+        # here — the sort key, then is_dir() and is_symlink() again in the loop.
+        with os.scandir(p) as it:
+            entries = list(it)
+        entries.sort(key=lambda e: (not e.is_dir(), e.name.lower()))
+        for x in entries:
             total += 1
-            if pattern and not _safe_match(x, pattern):
+            if pattern and not _safe_match(Path(x.path), pattern):
                 continue
-            if x.is_dir():
+            is_dir = x.is_dir()
+            if is_dir:
                 dirs += 1
             else:
                 files += 1
-            names.append(x.name + ("/" if x.is_dir() else "") + ("@" if x.is_symlink() else ""))
+            names.append(x.name + ("/" if is_dir else "") + ("@" if x.is_symlink() else ""))
 
         # A filter that matched nothing used to return "0 entries" and stop
         # there — a dead end, when the harness knew perfectly well the directory
@@ -517,9 +525,10 @@ def search_file_tool(filename: str, text: str) -> Dict[str, Any]:
     p = resolve_abs_path(filename)
     try:
         matches = []
+        needle = text.lower()
         with open(p, "r", encoding="utf-8") as f:
             for i, line in enumerate(f, start=1):
-                if text.lower() in line.lower():
+                if needle in line.lower():
                     matches.append({"line": i, "content": line.rstrip()})
     except OSError as e:
         return _fs_error(e, p)
@@ -1089,6 +1098,13 @@ class SessionStore:
         try:
             db_path.parent.mkdir(parents=True, exist_ok=True)
             self.db = sqlite3.connect(str(db_path))
+            # WAL + synchronous=NORMAL: every add() commits (one fsync each), and
+            # a chatty turn writes the assistant call plus one row per tool
+            # result. WAL keeps that durable while collapsing the per-commit fsync
+            # cost. journal_mode is persisted in the db file; synchronous is
+            # per-connection, so it is set on every open.
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=NORMAL")
             self.db.executescript(SCHEMA)
             self._ensure_fts()
             cur = self.db.execute(

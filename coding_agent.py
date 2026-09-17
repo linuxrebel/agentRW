@@ -148,7 +148,7 @@ RESET_COLOR     = "\033[0m"  if _ANSI else ""
 SLASH_COMMANDS = (
     "/help", "/model", "/gpu-layers", "/low-vram", "/compact", "/tokens", "/recall",
     "/ingest",
-    "/reset", "/pwd", "/plugins", "/tools", "/ops", "/olist", "/cloud-models", "/update",
+    "/reset", "/pwd", "/plugins", "/tools", "/ops", "/olist", "/show", "/cloud-models", "/update",
     "/save",
     "/bye", "cd <path>",
 )
@@ -2463,6 +2463,18 @@ def run(model: str, gpu_layers: Optional[int] = None,
                 print(_r.stdout, end="")
             if _r.stderr:
                 print(_r.stderr, end="")
+            continue
+
+        if user.lower().startswith("/show"):
+            # Flags pass straight through to `ollama show`, so /show --template,
+            # --parameters, --help (etc.) all work without a per-flag branch —
+            # ollama owns the flag list. List-form subprocess, no shell, so a
+            # forwarded token cannot inject. Bare /show is the overview, whose
+            # Capabilities line answers "does this model support tools".
+            _flags = user.split()[1:]
+            _r = subprocess.run(["ollama", "show", model, *_flags],
+                                capture_output=True, text=True)
+            print(_r.stdout or _r.stderr, end="")
             continue
 
         if user.lower() == "/update":

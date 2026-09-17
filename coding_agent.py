@@ -2474,7 +2474,10 @@ def run(model: str, gpu_layers: Optional[int] = None,
             _flags = user.split()[1:]
             _r = subprocess.run(["ollama", "show", model, *_flags],
                                 capture_output=True, text=True)
-            print(_r.stdout or _r.stderr, end="")
+            # rstrip + default newline: `ollama show --system` emits no trailing
+            # newline, which glued the next prompt onto the output. One newline
+            # always, whether or not ollama terminated its own.
+            print((_r.stdout or _r.stderr).rstrip("\n"))
             continue
 
         if user.lower() == "/update":

@@ -552,9 +552,28 @@ def test_ctx_ask_calls_call_llm():
     print("  ctx.ask routes through call_llm                 ok")
 
 
+def test_ctx_no_lint_pipeline_names():
+    ctx = ca.plugin_context("m", {"num_ctx": 2048, "token_budget": 2000}, [None])
+    for gone in ("gather_findings", "propose_fix", "apply_fix",
+                 "finish_run", "defer", "debt_file"):
+        assert not hasattr(ctx, gone), f"{gone} should be gone from ctx"
+    print("  ctx no longer carries the lint pipeline names   ok")
+
+
+def test_core_pipeline_functions_removed():
+    for gone in ("_gather_findings", "_propose_fix", "_propose_or_compute",
+                 "_apply_fix", "_apply_insert", "_apply_checked", "_finish_run",
+                 "_clean_proposal", "_defer", "_parses",
+                 "FIX_PROMPT", "INSERT_PROMPT", "DEBT_FILE"):
+        assert not hasattr(ca, gone), f"{gone} should be removed from core"
+    print("  core no longer defines the lint pipeline        ok")
+
+
 if __name__ == "__main__":
     test_ctx_has_ask_and_api_2()
     test_ctx_ask_calls_call_llm()
+    test_ctx_no_lint_pipeline_names()
+    test_core_pipeline_functions_removed()
     test_errors_are_slugs_not_prose()
     test_search_reports_what_it_cut()
     test_arguments_are_parsed_as_tolerantly_as_calls()

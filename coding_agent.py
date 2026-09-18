@@ -611,13 +611,6 @@ def plugin_context(model: str, cfg: dict, layers_ref: list):
         resolve_path=resolve_abs_path,
         writable=_writable,
         write_denied=_write_denied,
-        # the finding pipeline
-        gather_findings=_gather_findings,
-        propose_fix=_propose_or_compute,
-        apply_fix=_apply_fix,
-        finish_run=_finish_run,
-        defer=_defer,
-        debt_file=DEBT_FILE,
         # output
         summarise=_summarise_result,
         render=_render_result,
@@ -1401,7 +1394,6 @@ def estimate_tokens(messages: list) -> int:
     return sum(len(m.get("content", "")) for m in messages) // _CHARS_PER_TOKEN
 
 
-
 # A single tool result may take at most this share of the budget. The rest has
 # to stay free for the system prompt, the question, and the answer.
 TOOL_RESULT_SHARE = 0.5
@@ -1559,8 +1551,6 @@ def _tools_schema() -> List[Dict[str, Any]]:
             "parameters": {"type": "object", "properties": props,
                            "required": required}}})
     return out
-
-
 
 
 def _reply_text(msg) -> str:
@@ -1784,148 +1774,6 @@ def _confirm_command(cmd: str) -> bool:
     return answer in ("y", "yes")
 
 
-# Deliberately does NOT say "preserve indentation exactly". For a
-# bad-indentation finding the indentation IS the fix, and that instruction made
-# gemma4 return the line with no indentation at all, 3 times out of 3.
-FIX_PROMPT = """You rewrite ONE line of Python to fix one specific issue. Output \
-ONLY that line, no explanation, no fences, no commentary. Keep the leading \
-whitespace correct for the surrounding block. Change nothing except what the \
-issue asks for. If rewriting this line cannot fix the issue, output UNFIXABLE."""
-
-INSERT_PROMPT = """You write ONE new line of Python to insert into a file. Output \
-ONLY that line, no explanation, no fences, no commentary. Match the surrounding \
-indentation exactly. If you cannot, output UNFIXABLE."""
-
-DEBT_FILE = "DEBT.md"
-
-
-def _gather_findings(path: str, only: str = "") -> List[Dict[str, Any]]:
-    """Flatten lint output into individual findings, worst kinds first.
-
-    Uses the lint_file tool's own API, so any detector exposing the same shape
-    (overview -> top_issues, symbol=X -> occurrences) plugs in unchanged.
-    """
-    lint = TOOL_REGISTRY.get("lint_file")
-    if not lint:
-        return []
-    # One call. Running the detector once per symbol re-analyses the file for
-    # data the first run already had.
-    res = lint(filename=path, symbol=only or "*")
-    if "error" in res:
-        return [{"error": res["error"]}]
-    # Detectors may attach meaning / action_kind / action / raw. Carried through
-    # verbatim — the harness reads them but owns none of that knowledge.
-    out = [{**o, "symbol": o.get("symbol", only)} for o in res.get("occurrences", [])]
-    # Descending: an insert or edit shifts every line BELOW it, so working from
-    # the bottom up means a finding's line number is still valid when reached.
-    # Ascending left 13 of 17 findings pointing at lines that no longer existed.
-    return sorted(out, key=lambda f: -f["line"])
-
-
-def _propose_fix(model: str, cfg: dict, layers_ref: list,
-                 lines: List[str], finding: Dict[str, Any]) -> str:
-    """Ask the model to rewrite one line. Deliberately does NOT use the agent
-    system prompt — one bounded decision needs ~200 tokens of context, not 593,
-    and nothing accumulates between findings."""
-    n = finding["line"]
-    lo, hi = max(n - 3, 0), min(n + 2, len(lines))
-    context = "".join(f"{i+1}: {lines[i]}" for i in range(lo, hi))
-    target = lines[n - 1].rstrip("\n")
-    kind = finding.get("action_kind", "line")
-    if kind in ("insert_after", "insert_top"):
-        where = "at the very top of the file" if kind == "insert_top" \
-            else f"immediately after line {n}"
-        msgs = [
-            {"role": "system", "content": INSERT_PROMPT},
-            {"role": "user", "content": (
-                f"Issue: {finding['symbol']} — {finding['message']}\n"
-                f"Goal: {finding.get('action', '')}\n\n"
-                f"Context:\n{context}\n"
-                f"Write the ONE line to insert {where}.")},
-        ]
-    else:
-        msgs = [
-            {"role": "system", "content": FIX_PROMPT},
-            {"role": "user", "content": (
-                f"Issue: {finding['symbol']} — {finding['message']}\n"
-                # The detector already worked out what the fix is. Withholding
-                # it left the model with the complaint and no instruction.
-                f"Goal: {finding.get('action', 'fix the issue on this line')}\n\n"
-                f"Context:\n{context}\n"
-                f"Rewrite ONLY line {n}:\n{target}")},
-        ]
-    raw = call_llm(model, msgs, gpu_layers=layers_ref, max_tokens=300,
-                   num_ctx=cfg["num_ctx"], token_budget=cfg["token_budget"],
-                   send_tools=False) or ""
-    return _clean_proposal(raw)
-
-
-def _parses(text: str) -> bool:
-    try:
-        compile(text, "<check>", "exec")
-        return True
-    except SyntaxError:
-        return False
-
-
-def _apply_checked(path: Path, before: str, after: str) -> Dict[str, Any]:
-    """Write `after`. Validation happens at the END of a run, not per edit.
-
-    Per-edit checking looks right and is wrong: changing one line from 2-space
-    to 4-space indentation leaves it inconsistent with its not-yet-fixed
-    siblings, so the file does not parse mid-run even though the finished set
-    does. Vetoing each edit cut a run from 16 fixes to 4 and the score from
-    9.57 to 4.35. `before` is kept in the signature so callers read as
-    intentional; see _finish_run for where the check actually lives.
-    """
-    return write_file_tool(str(path), after)
-
-
-def _finish_run(path: Path, snapshot: str) -> bool:
-    """After all edits: if a parseable file is now broken, put it back.
-
-    True if the file is fine (or was already broken before we started).
-    """
-    if path.suffix != ".py" or not _parses(snapshot):
-        return True
-    if _parses(path.read_text(encoding="utf-8")):
-        return True
-    path.write_text(snapshot, encoding="utf-8")
-    return False
-
-
-def _apply_fix(path: Path, lines: List[str], finding: Dict[str, Any],
-               new: str) -> Dict[str, Any]:
-    """Apply one fix according to its action_kind. The ONLY place that decides
-    replace-vs-insert.
-
-    Three separate bugs came from callers reimplementing this: a driver that
-    inserted reindented lines instead of replacing them, one that skipped the
-    shebang check, and one that bypassed the write guard. Callers pass a
-    finding and a line; they do not get to choose the operation.
-    """
-    kind = finding.get("action_kind", "line")
-    if kind == "line" or kind.startswith("reindent"):
-        out = list(lines)
-        out[finding["line"] - 1] = new + "\n"
-    elif kind.startswith("insert"):
-        out = _apply_insert(lines, finding, new)
-    else:
-        return {"error": "no_automatic_fix", "action_kind": kind}
-    return _apply_checked(path, "".join(lines), "".join(out))
-
-
-def _propose_or_compute(model: str, cfg: dict, layers_ref: list,
-                        lines: List[str], finding: Dict[str, Any]) -> str:
-    """The fix for a finding — computed when the detector already knows it,
-    generated only when judgement is genuinely required."""
-    kind = finding.get("action_kind", "line")
-    if kind.startswith("reindent"):
-        want = int(kind.split(":")[1]) if ":" in kind else 4
-        return " " * want + lines[finding["line"] - 1].lstrip().rstrip("\n")
-    return _propose_fix(model, cfg, layers_ref, lines, finding)
-
-
 INGEST_MAP_PROMPT = (
     "You summarize a slice of a source file for a durable index. In 2-3 "
     "sentences, say what this slice defines and does. Name key functions, "
@@ -2018,70 +1866,6 @@ def ingest_file(path: str, model: str, store, layers_ref: list, cfg: dict,
                       len(chunks), digest, model, chunk_summaries)
     return {"path": key, "lines": len(lines), "n_chunks": len(chunks),
             "digest": digest, "cached": False}
-
-
-def _apply_insert(lines: List[str], finding: Dict[str, Any], new: str) -> List[str]:
-    """Insert `new` for an insert_top / insert_after finding.
-
-    One implementation, so a caller cannot get a different answer than /lint —
-    a test driver with its own copy of this logic reported a shebang fix as
-    working when it had never run.
-    """
-    if finding.get("action_kind") == "insert_top":
-        # A shebang only works as line 1. Inserting above it satisfies pylint
-        # and silently breaks ./script.py.
-        at, indent = (1 if lines and lines[0].startswith("#!") else 0), ""
-    else:
-        at = finding["line"]
-        # Match the indentation the body ACTUALLY uses, not def-indent + 4.
-        # A file indented with 2 spaces got a 4-space docstring and every
-        # function broke with "unindent does not match any outer indentation
-        # level" — the docstring must join the block, not impose PEP 8 on it.
-        indent = ""
-        for nxt in lines[finding["line"]:]:
-            if nxt.strip():
-                indent = re.match(r'\s*', nxt).group(0)
-                break
-        own = re.match(r'\s*', lines[finding["line"] - 1]).group(0)
-        if len(indent) <= len(own):
-            # `def f(): pass` — the body is on the def line, so there is no
-            # block to join. Inserting anywhere here is a syntax error.
-            return list(lines)
-    out = list(lines)
-    out.insert(at, f"{indent}{new.strip()}\n")
-    return out
-
-
-def _clean_proposal(raw: str) -> str:
-    """One usable line, or "" — never partly-usable garbage.
-
-    Weaker models wrap answers in ``` fences, emit several lines when one was
-    asked for, and bury the word UNFIXABLE inside a fence. All of that used to
-    be written to the file verbatim.
-
-    Leading whitespace is never stripped: for a bad-indentation fix, the leading
-    whitespace IS the fix.
-    """
-    if "UNFIXABLE" in raw.upper():
-        return ""
-    lines = [ln for ln in raw.rstrip().splitlines()
-             if ln.strip() and not re.match(r'^\s*```', ln)]
-    if len(lines) != 1:
-        return ""          # nothing, or prose where one line was required
-    one = lines[0].rstrip()
-    # Also strip INLINE backticks. qwen returned `"""..."""` wrapped in single
-    # backticks, which the fence rule missed and which went into the file as a
-    # syntax error.
-    m = re.match(r'^(\s*)`+(.*?)`+$', one)
-    return f"{m.group(1)}{m.group(2)}" if m else one
-
-
-def _defer(path: str, finding: Dict[str, Any], note: str = "") -> None:
-    """Deferred work goes to a ledger instead of evaporating."""
-    ledger = resolve_abs_path(DEBT_FILE)
-    with open(ledger, "a", encoding="utf-8") as f:
-        f.write(f"- [ ] {path}:{finding['line']} {finding['symbol']} — "
-                f"{finding['message']}{(' (' + note + ')') if note else ''}\n")
 
 
 def _render_result(result: dict) -> str:

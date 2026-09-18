@@ -524,7 +524,37 @@ def test_ingest_guards_empty_digest():
         print("  ingest refuses to persist an empty digest      ok")
 
 
+def test_ctx_has_ask_and_api_2():
+    ctx = ca.plugin_context("m", {"num_ctx": 2048, "token_budget": 2000}, [None])
+    assert ctx.api == 2
+    assert callable(ctx.ask)
+    print("  ctx exposes ask, api is 2                       ok")
+
+
+def test_ctx_ask_calls_call_llm():
+    seen = {}
+    orig = ca.call_llm
+    try:
+        def fake(model, messages, **kw):
+            seen["model"] = model
+            seen["kw"] = kw
+            return "ok"
+        ca.call_llm = fake
+        ctx = ca.plugin_context("mymodel",
+                                {"num_ctx": 2048, "token_budget": 2000}, [7])
+        out = ctx.ask([{"role": "user", "content": "hi"}], max_tokens=50)
+    finally:
+        ca.call_llm = orig
+    assert out == "ok"
+    assert seen["model"] == "mymodel"
+    assert seen["kw"]["send_tools"] is False
+    assert seen["kw"]["max_tokens"] == 50
+    print("  ctx.ask routes through call_llm                 ok")
+
+
 if __name__ == "__main__":
+    test_ctx_has_ask_and_api_2()
+    test_ctx_ask_calls_call_llm()
     test_errors_are_slugs_not_prose()
     test_search_reports_what_it_cut()
     test_arguments_are_parsed_as_tolerantly_as_calls()

@@ -588,16 +588,25 @@ PLUGIN_STATUS: List[Dict[str, Any]] = []  # what /plugins reports
 # third-party plugins. Add to it freely; change or remove only with a version
 # bump. Plugins should read ctx.api and refuse to run on a version they do not
 # understand.
-PLUGIN_API = 1
+PLUGIN_API = 2
 
 
 def plugin_context(model: str, cfg: dict, layers_ref: list):
     """Build the ctx handed to a plugin command."""
+    def _ask(messages, max_tokens=300, send_tools=False, no_think=False):
+        # Raw model access for plugins: the harness's trimming + error handling,
+        # no lint-shaped prompt. Bound to the live session model/layers/cfg.
+        return call_llm(model, messages, gpu_layers=layers_ref,
+                        max_tokens=max_tokens, num_ctx=cfg.get("num_ctx"),
+                        token_budget=cfg.get("token_budget", TOKEN_BUDGET),
+                        send_tools=send_tools, no_think=no_think)
     return types.SimpleNamespace(
         api=PLUGIN_API,
         # session
         model=model, cfg=cfg, layers=layers_ref, cwd=_agent_cwd[0],
         tools=TOOL_REGISTRY,
+        # raw model access (any plugin)
+        ask=_ask,
         # paths and writing
         resolve_path=resolve_abs_path,
         writable=_writable,

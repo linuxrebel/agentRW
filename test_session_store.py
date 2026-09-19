@@ -574,6 +574,10 @@ def test_parse_use_request():
     assert ca.parse_use_request("USE: read_file write_file") == ["read_file", "write_file"]
     assert ca.parse_use_request("sure, here is an answer") == []
     assert ca.parse_use_request("USE: not_a_tool") == []   # filtered to registry
+    # weak models abbreviate the tool name and tack the path on the USE line
+    assert ca.parse_use_request("USE: read /home/x.py") == ["read_file"]
+    assert ca.parse_use_request("USE: write") == ["write_file"]
+    assert ca.parse_use_request("USE: re") == []           # read_file+recall -> ambiguous, dropped
     print("  parse_use_request extracts + filters USE line   ok")
 
 

@@ -832,7 +832,21 @@ def parse_use_request(reply: str) -> List[str]:
     m = _USE_RE.search(reply or "")
     if not m:
         return []
-    return [w for w in re.split(r'[\s,]+', m.group(1).strip()) if w in TOOL_REGISTRY]
+    out = []
+    for w in re.split(r'[\s,]+', m.group(1).strip()):
+        if not w:
+            continue
+        if w in TOOL_REGISTRY:
+            hit = w
+        else:
+            # Weak models abbreviate the name — "read" for read_file. Resolve a
+            # token to a tool only when it matches exactly one, so ambiguous ones
+            # (run -> run_command/run_tests) are dropped, never guessed.
+            cand = [n for n in TOOL_REGISTRY if n.startswith(w)]
+            hit = cand[0] if len(cand) == 1 else None
+        if hit and hit not in out:
+            out.append(hit)
+    return out
 
 
 def _tool_names_block() -> str:

@@ -569,6 +569,56 @@ def test_core_pipeline_functions_removed():
     print("  core no longer defines the lint pipeline        ok")
 
 
+def test_parse_use_request():
+    assert ca.parse_use_request("USE: read_file") == ["read_file"]
+    assert ca.parse_use_request("USE: read_file write_file") == ["read_file", "write_file"]
+    assert ca.parse_use_request("sure, here is an answer") == []
+    assert ca.parse_use_request("USE: not_a_tool") == []   # filtered to registry
+    print("  parse_use_request extracts + filters USE line   ok")
+
+
+def test_pull_prompt_lists_names_and_use_protocol():
+    p = ca.build_prompt(pull=True)
+    assert "USE:" in p
+    assert "read_file" in p and "write_file" in p
+    # names+one-liners only: no full signature parens block for tools
+    assert "(filename" not in p
+    # smaller than the old push prompt
+    assert len(p) < len(ca.build_prompt(pull=False))
+    print("  pull prompt: names+USE, no schemas, smaller       ok")
+
+
+def test_two_pass_pull_then_call():
+    # pass1 returns USE, pass2 returns a real call; assert both happen in order.
+    calls = []
+    orig = ca.call_llm
+    active = set(ca._active_tools)
+    try:
+        def fake(model, messages, **kw):
+            calls.append(kw.get("send_tools"))
+            return "USE: read_file" if len(calls) == 1 else 'read_file({"filename":"/x"})'
+        ca.call_llm = fake
+        messages = [{"role": "system", "content": "seed"},
+                    {"role": "user", "content": "read /x"}]
+        reply, tools = ca._turn_reply(messages, "m", [None],
+                                      {"num_ctx": None, "token_budget": ca.TOKEN_BUDGET,
+                                       "max_tokens": 200}, None)
+    finally:
+        ca.call_llm = orig
+        ca._active_tools.clear()
+        ca._active_tools.update(active)
+    assert calls == [False, True]           # pass1 no schema, pass2 schema
+    assert tools and tools[0][0] == "read_file"
+    print("  two-pass: USE on pass1, tool call on pass2       ok")
+
+
+def test_smalltalk_retired():
+    # pull removes the need for the greeting whitelist; it must be gone.
+    assert not hasattr(ca, "_is_smalltalk")
+    assert not hasattr(ca, "_SMALLTALK")
+    print("  smalltalk guard retired under pull               ok")
+
+
 if __name__ == "__main__":
     test_ctx_has_ask_and_api_2()
     test_ctx_ask_calls_call_llm()
@@ -601,4 +651,8 @@ if __name__ == "__main__":
     test_ingest_max_chunks_guard_trips_before_model()
     test_no_think_sets_reasoning_effort()
     test_ingest_guards_empty_digest()
+    test_parse_use_request()
+    test_pull_prompt_lists_names_and_use_protocol()
+    test_two_pass_pull_then_call()
+    test_smalltalk_retired()
     print("all session-store tests passed")

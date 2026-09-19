@@ -14,9 +14,10 @@ you're driving Claude or GPT through an API.
 scarce resource is not model capability but the context window. Every design choice
 follows from that:
 
-- The system prompt is **539 tokens** — 26% of a 2048-token window, measured and
-  trimmed rather than guessed at. Each plugin tool you add costs ~40 more, on
-  every turn, unless you leave it unadvertised.
+- The system prompt is trimmed to the minimum, measured rather than guessed at.
+  Tools are **pulled, not pushed**: a turn's first call sends only tool *names*,
+  and a tool's full ~40-token schema is sent only for the tools the model asks
+  for that turn — so a tool it does not reach for never costs its schema.
 
 - Shell commands run *directly*, never through the model. Typing `ls` or `git status`
   costs zero tokens.
@@ -331,10 +332,12 @@ linuxrebel/runtests ACTIVE   tools: run_tests
     needs pytest: MISSING   pip: pytest  fedora: python3-pytest  debian: python3-pytest
 ```
 
-**Commands are free; tools are not.** A command costs nothing until you invoke
-it. A tool's docstring rides in the system prompt, which is re-sent with *every*
-request — so an advertised tool costs its tokens every turn, used or not.
-Loading is irrelevant: a plugin loads in 0.2 ms.
+**Commands are free; tool schemas are pulled.** A command costs nothing until
+you invoke it. Tools are advertised by *name* on a turn's first call; the full
+docstring-and-signature schema is sent only for the tools the model requests
+(`USE: <tool>`) that turn — so a tool it does not reach for costs only its
+one-line name, not its full schema. Loading is irrelevant: a plugin loads in
+0.2 ms.
 
 Dispatch and advertisement are separate, so a tool can be callable without being
 advertised:
@@ -356,6 +359,7 @@ install instructions and its own README saying what it will do to your files:
 | `linuxrebel/format` | `format_file` | autopep8 | [arwPyFormat](https://github.com/linuxrebel/arwPyFormat) |
 | `linuxrebel/lint` | `lint_file`, `/lint` | pylint, autopep8 | [arwLint](https://github.com/linuxrebel/arwLint) |
 | `linuxrebel/runtests` | `run_tests`, `/runtests` | pytest | [arwRunTests](https://github.com/linuxrebel/arwRunTests) |
+| `linuxrebel/pdf` | `read_pdf` | pdftotext (poppler) | [arwPdf](https://github.com/linuxrebel/arwPdf) |
 
 **`/lint <file>`** walks pylint findings one at a time — fix, skip, ignore the
 whole kind, defer to `DEBT.md`, or see the raw message. It explains what each

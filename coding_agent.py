@@ -242,7 +242,7 @@ def read_file_tool(
     start_line: int = 1,
     max_lines: int = 200,
 ) -> Dict[str, Any]:
-    """Read lines from a file. Use full absolute paths."""
+    """Read lines from any UTF-8 text file — code, Markdown, JSON, config, logs, plain text. Use full absolute paths."""
     path = resolve_abs_path(filename)
     try:
         with open(path, "r", encoding="utf-8") as f:

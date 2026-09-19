@@ -375,6 +375,11 @@ def test_json_tool_call_format():
         ('just prose, no calls at all', []),
         # the paren form must still win, unchanged
         ('read_file({"filename":"/x/y.py"})', [("read_file", {"filename": "/x/y.py"})]),
+        # weak models emit Python literals in the JSON blob — tolerate them
+        ('{"name":"read_file","parameters":{"filename":"/x/y.py","max_lines":None,"start_line":None}}',
+         [("read_file", {"filename": "/x/y.py", "max_lines": None, "start_line": None})]),
+        ('{"name":"read_file","parameters":{"filename":"/x/y.py","recurse":True}}',
+         [("read_file", {"filename": "/x/y.py", "recurse": True})]),
     ]
     for text, want in cases:
         assert ca.extract_tools(text) == want, (text, ca.extract_tools(text))

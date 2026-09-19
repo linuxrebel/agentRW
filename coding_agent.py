@@ -987,6 +987,26 @@ _TOOL_CALL_RE = re.compile(
 )
 
 
+def _loads_tolerant(s: str):
+    """json.loads, retried once with Python literals normalized to JSON.
+
+    Weak models emit near-JSON: None/True/False (Python) instead of
+    null/true/false (JSON). Applied only after a strict parse fails, so
+    well-formed JSON — including legitimate "None" string values — is never
+    touched. Word-boundary substitution so it does not maul substrings.
+    ponytail: an already-broken blob whose string value contains None/True/False
+    (e.g. write_file content of Python source) can be altered; acceptable since
+    that blob would not have parsed at all otherwise.
+    """
+    try:
+        return json.loads(s, strict=False)
+    except Exception:
+        fixed = re.sub(r'\bNone\b', 'null', s)
+        fixed = re.sub(r'\bTrue\b', 'true', fixed)
+        fixed = re.sub(r'\bFalse\b', 'false', fixed)
+        return json.loads(fixed, strict=False)
+
+
 def _extract_json_tool_calls(text: str) -> List[Tuple[str, Dict[str, Any]]]:
     """Parse {"name": ..., "arguments": {...}} objects emitted as plain text.
 
@@ -998,14 +1018,14 @@ def _extract_json_tool_calls(text: str) -> List[Tuple[str, Dict[str, Any]]]:
     blobs = []
     stripped = re.sub(r'^```(?:json)?\s*|\s*```$', '', text.strip())
     try:
-        whole = json.loads(stripped)          # the whole reply is the call
+        whole = _loads_tolerant(stripped)     # the whole reply is the call
         blobs = whole if isinstance(whole, list) else [whole]
     except Exception:
         blobs = []
         for m in re.finditer(r'\{[^{}]*"name"\s*:\s*"\w+".*?\}\s*\}|'
                              r'\{[^{}]*"name"\s*:\s*"\w+"[^{}]*\}', text, re.DOTALL):
             try:
-                blobs.append(json.loads(m.group(0)))
+                blobs.append(_loads_tolerant(m.group(0)))
             except Exception:
                 continue
 

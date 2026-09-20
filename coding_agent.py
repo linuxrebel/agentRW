@@ -181,11 +181,45 @@ def _writable(p: Path) -> bool:
     Blocks the model from reaching ~/.bashrc, ~/.ssh/authorized_keys, or this
     script. Every write path routes through here, so one check covers all.
     """
+    # The .bak is the harness's own safety copy. write_file reports its path to
+    # the model, and a model that had just edited a file went on to edit the
+    # backup of it — destroying the one recoverable copy. It is never a target.
+    if p.suffix == ".bak":
+        return False
     target = p.resolve() if p.exists() else p.parent.resolve() / p.name
     for root in [_agent_cwd[0].resolve(), *_extra_write_dirs]:
         if target == root or root in target.parents:
             return True
     return False
+
+
+def _reindent_match(text: str, old_str: str, new_str: str) -> Optional[str]:
+    """Apply an edit whose only error is the leading indentation.
+
+    A model copying a block out of a file routinely loses the base indent — the
+    lines are right, the block just sits inside an `if`. Measured: every line
+    correct, one unique match, refused on whitespace while the harness held
+    both strings.
+
+    Matches line-by-line on stripped content and applies ONLY when exactly one
+    block matches, so nothing is guessed. new_str is shifted by the same amount
+    the file's block is indented, keeping its internal structure.
+    """
+    f_lines, o_lines = text.splitlines(), old_str.splitlines()
+    if not o_lines or len(o_lines) > len(f_lines):
+        return None
+    want = [l.strip() for l in o_lines]
+    hits = [i for i in range(len(f_lines) - len(o_lines) + 1)
+            if [l.strip() for l in f_lines[i:i + len(o_lines)]] == want]
+    if len(hits) != 1:
+        return None                       # ambiguous or absent: not our call
+    i = hits[0]
+    f_indent = f_lines[i][:len(f_lines[i]) - len(f_lines[i].lstrip())]
+    o_indent = o_lines[0][:len(o_lines[0]) - len(o_lines[0].lstrip())]
+    shift = f_indent[len(o_indent):] if f_indent.startswith(o_indent) else f_indent
+    shifted = [shift + l if l.strip() else l for l in new_str.splitlines()]
+    return "\n".join(f_lines[:i] + shifted + f_lines[i + len(o_lines):]) + (
+        "\n" if text.endswith("\n") else "")
 
 
 def _write_backup(bak: Path, text: str) -> None:
@@ -199,6 +233,10 @@ def _write_backup(bak: Path, text: str) -> None:
 
 
 def _write_denied(p: Path) -> Dict[str, Any]:
+    if p.suffix == ".bak":
+        return {"error": "backup_is_not_a_target", "path": str(p),
+                "hint": f"{p.name} is this harness's backup copy. Edit "
+                        f"{p.with_suffix('').name} instead."}
     allowed = ", ".join(str(d) for d in [_agent_cwd[0], *_extra_write_dirs])
     return {
         "error": "write_outside_allowed_dirs",
@@ -370,7 +408,7 @@ def list_files_tool(path: str, pattern: str = "") -> Dict[str, Any]:
 
 
 def edit_file_tool(path: str, old_str: str, new_str: str) -> Dict[str, Any]:
-    """Replace old_str with new_str in a file. Empty old_str creates the file."""
+    """Replace old_str with new_str in a file — read the file first, old_str must match its text verbatim. Empty old_str creates the file."""
     p = resolve_abs_path(path)
     if not _writable(p):
         return _write_denied(p)
@@ -386,14 +424,34 @@ def edit_file_tool(path: str, old_str: str, new_str: str) -> Dict[str, Any]:
             return {"path": str(p), "action": "created"}
 
         text = p.read_text(encoding="utf-8")
-        if old_str not in text:
-            return {"path": str(p), "action": "not_found",
-                    "hint": "old_str was not found verbatim in the file."}
+        reindented = None if old_str in text else _reindent_match(text, old_str, new_str)
+        if old_str not in text and reindented is None:
+            # An error, not an outcome. As `action` it carried no "error" key,
+            # so the turn's error counter never incremented and the 3-strike
+            # guard never tripped: a model guessing old_str looped until the
+            # tool-call cap, four identical failures deep, with the hint hidden
+            # from the console.
+            #
+            # The contents come back with the error. This function just read the
+            # file to compare against; answering "go and read it" while holding
+            # the text made the model spend two more steps fetching what the
+            # harness already had, and it often guessed again instead.
+            return {"error": "old_str_not_found", "path": str(p),
+                    "file_contents": text[:MAX_ERROR_FILE_CHARS],
+                    "truncated": len(text) > MAX_ERROR_FILE_CHARS,
+                    "hint": "old_str is not in the file. The file's exact text is "
+                            "in file_contents — copy the lines you want to replace "
+                            "from it verbatim and call edit_file again."}
 
         bak = p.with_suffix(p.suffix + ".bak")
         if not bak.exists():
             _write_backup(bak, text)
 
+        if reindented is not None:
+            p.write_text(reindented, encoding="utf-8")
+            return {"path": str(p), "action": "edited", "backup": str(bak),
+                    "note": "old_str matched apart from its leading indentation; "
+                            "the replacement was indented to match the file."}
         p.write_text(text.replace(old_str, new_str, 1), encoding="utf-8")
         return {"path": str(p), "action": "edited", "backup": str(bak)}
     except OSError as e:
@@ -490,6 +548,11 @@ def run_command_tool(cmd: str, timeout: int = 30) -> Dict[str, Any]:
 
 
 MAX_SEARCH_MATCHES = 100
+
+# An old_str_not_found error carries the file back with it. Sized so a typical
+# source file arrives whole while a huge one cannot swamp a 2048-token window;
+# the result is capped again by _cap_tool_result on the way in.
+MAX_ERROR_FILE_CHARS = 4000
 
 
 def search_file_tool(filename: str, text: str) -> Dict[str, Any]:
@@ -759,9 +822,27 @@ def ingest_tool(path: str) -> Dict[str, Any]:
 ingest_tool.model_facing = True
 
 
+def use_tools_tool(names: str) -> Dict[str, Any]:
+    """Load the tools you need for this step, e.g. names="read_file edit_file"."""
+    want = _resolve_tool_names(names)
+    if not want:
+        return {"error": "no_such_tool", "names": names,
+                "hint": f"Available: {sorted(n for n in TOOL_REGISTRY if n != 'use_tools')}"}
+    _active_tools.clear()
+    _active_tools.update(want)
+    return {"loaded": want}
+
+
+# Not model_facing: it is the toolbox itself, not a tool in it, so it never
+# appears in the pull menu. It IS in the registry so `_TOOL_CALL_RE` — built
+# from the registry's names — matches a model that calls it as text.
+use_tools_tool.model_facing = False
+
+
 TOOL_REGISTRY = {**CORE_TOOLS,
                  "recall": recall_tool,
                  "ingest": ingest_tool,
+                 "use_tools": use_tools_tool,
                  **load_plugins(Path(__file__).resolve().parent / "tools")}
 
 
@@ -820,21 +901,27 @@ def tool_cost(name: str) -> int:
     return len(_tool_block(name, TOOL_REGISTRY[name])) // 4
 
 
-_USE_RE = re.compile(r'^\s*USE:\s*(.+)$', re.MULTILINE)
+# Leading markdown is tolerated because the instruction itself writes the
+# sentinel as `USE: <tool>` — models echo the backticks and asterisks back.
+_USE_RE = re.compile(r'^[\s`*_>#-]*USE\**:\s*(.+)$', re.MULTILINE)
+
+# A reply longer than this is an answer that mentions a tool, not a request for
+# one. Measured: real requests ran 15-45 chars.
+MENTION_MAX_CHARS = 200
 
 
-def parse_use_request(reply: str) -> List[str]:
-    """Tool names from a model's `USE: ...` line, filtered to the registry.
+def _resolve_tool_names(text: str) -> List[str]:
+    """Registry names from a whitespace/comma list, tolerantly.
 
-    The harness's own sentinel — the model's request to pull tools. Not the
-    user's words: the harness never parses natural language for tool gating.
+    Shared by the `use_tools` tool and the `USE:` text fallback, so both accept
+    the same spellings.
     """
-    m = _USE_RE.search(reply or "")
-    if not m:
-        return []
     out = []
-    for w in re.split(r'[\s,]+', m.group(1).strip()):
-        if not w:
+    for w in re.split(r'[\s,]+', (text or "").strip()):
+        # Models copy the instruction's own markdown back — `write_file` in
+        # backticks matched nothing and leaked the USE: line to the user.
+        w = w.strip('`\'"*_.:;()[]')
+        if not w or w == "use_tools":
             continue
         if w in TOOL_REGISTRY:
             hit = w
@@ -842,11 +929,42 @@ def parse_use_request(reply: str) -> List[str]:
             # Weak models abbreviate the name — "read" for read_file. Resolve a
             # token to a tool only when it matches exactly one, so ambiguous ones
             # (run -> run_command/run_tests) are dropped, never guessed.
-            cand = [n for n in TOOL_REGISTRY if n.startswith(w)]
+            cand = [n for n in TOOL_REGISTRY if n.startswith(w) and n != "use_tools"]
             hit = cand[0] if len(cand) == 1 else None
         if hit and hit not in out:
             out.append(hit)
     return out
+
+
+def names_mentioned(reply: str) -> List[str]:
+    """Last-resort pull: exact tool names in a short reply that asked for tools.
+
+    Format-independent, because chasing formats lost five times: the model wrote
+    `EDIT:`, `` `USE:` ``, `EXTRACTION: USE`, `use_tools read_file` with no
+    parentheses, and once parroted the instruction back as "EXACTLY one line:
+    USE: read_file write_file". Every one of those named the right tools; only
+    the wrapper differed. So stop reading the wrapper and read the names.
+
+    ponytail: gated on a short reply, because a long answer that happens to say
+    "read_file" is prose, not a request. Activating a tool only adds its schema
+    to the next call — nothing runs — so a false positive costs tokens, not
+    actions. Raise the ceiling if a real request ever exceeds it.
+    """
+    if not reply or len(reply) > MENTION_MAX_CHARS:
+        return []
+    return [n for n in TOOL_REGISTRY
+            if n != "use_tools" and re.search(rf'\b{re.escape(n)}\b', reply)]
+
+
+def parse_use_request(reply: str) -> List[str]:
+    """Tool names from a model's `USE: ...` line, filtered to the registry.
+
+    The text fallback for models without native tool calling. Models that have
+    it ask through `use_tools` instead — see _turn_reply. Either way the harness
+    parses only its own protocol, never the user's natural language.
+    """
+    m = _USE_RE.search(reply or "")
+    return _resolve_tool_names(m.group(1)) if m else []
 
 
 def _tool_names_block() -> str:
@@ -856,8 +974,9 @@ def _tool_names_block() -> str:
 
 PULL_INSTRUCTION = (
     "If the request needs to read, write, search, or run files or commands, "
-    "reply with EXACTLY one line: `USE: <tool> [<tool> ...]` and nothing else. "
-    "Otherwise answer normally.")
+    "call use_tools with the names you need, e.g. use_tools(names=\"read_file "
+    "edit_file\"). If you cannot call tools, reply with EXACTLY one line: "
+    "USE: <tool> [<tool> ...] and nothing else. Otherwise answer normally.")
 
 
 def _pull_prompt() -> str:
@@ -870,6 +989,24 @@ def _pull_prompt() -> str:
     """
     return ("You are a coding assistant. You have NO tools loaded right now.\n"
             "Available tools:\n" + _tool_names_block() + "\n\n" + PULL_INSTRUCTION)
+
+
+def _meta_schema() -> List[Dict[str, Any]]:
+    """The only schema pass 1 sends: the toolbox itself.
+
+    A model with native tool calling that is handed NO schema has to invent a
+    text format to ask for tools, and invents a different one each time — this
+    model produced `EDIT:`, then `` `USE:` ``, then `EXTRACTION: USE` in three
+    sessions. Each was a regex patch chasing the last dialect. Giving it one
+    real tool to call removes the reason to improvise: it asks through the
+    channel it was trained on. 49 tokens. `USE:` stays as the text fallback.
+    """
+    return [{"type": "function", "function": {
+        "name": "use_tools",
+        "description": _safe_doc(use_tools_tool).split(". ")[0],
+        "parameters": {"type": "object",
+                       "properties": {"names": {"type": "string"}},
+                       "required": ["names"]}}}]
 
 
 def build_prompt(pull: bool = False) -> str:
@@ -885,21 +1022,47 @@ def build_prompt(pull: bool = False) -> str:
                         .replace("{{", "{").replace("}}", "}")
 
 
-def _turn_reply(messages, model, layers_ref, cfg, store):
-    """The user turn's first model call, pull-style.
+def _turn_reply(messages, model, layers_ref, cfg, store, baseline):
+    """One step of a turn: back to the toolbox, take a tool, use it, put it down.
 
     Pass 1 sends the running history with a names-only prompt and NO OpenAI
     schema. If the model replies `USE: <tool>...`, advertise exactly those tools,
     swap in the full prompt, and make pass 2 with the schema. Returns
-    (reply, extract_tools(reply)) for the dispatch loop; multi-step tool chaining
-    after this stays plain push in run()'s loop. Chat turns never see a schema,
-    so weak models stop tool-hunting on them. The caller restores _active_tools.
+    (reply, extract_tools(reply)) for the dispatch loop.
+
+    Called for EVERY step, not just the turn's first. Pulling once and then
+    pushing for the rest of the turn locked the model into whatever it named
+    before it had looked at anything: asked to edit a file, it pulled edit_file,
+    lost read_file, could not obtain the verbatim old_str edit_file requires, and
+    invented the file's contents instead. A mechanic walks back to the toolbox
+    between bolts. `baseline` is the session's advertised set (the /tools bill) —
+    the drawer everything is returned to before each new pull.
     """
+    _active_tools.clear()
+    _active_tools.update(baseline)
     messages[0] = {"role": "system", "content": build_prompt(pull=True)}
     r1 = call_llm(model, messages, gpu_layers=layers_ref,
                   max_tokens=cfg["max_tokens"], num_ctx=cfg["num_ctx"],
-                  token_budget=cfg["token_budget"], send_tools=False, store=store)
-    want = parse_use_request(r1)
+                  token_budget=cfg["token_budget"], send_tools=True,
+                  schema=_meta_schema(), store=store)
+
+    # Structure first: the spec handed us the call as data. Text parsing only
+    # runs for models that returned none.
+    native = last_native_calls()
+    calls = [(n, a, i) for i, n, a in native] or extract_tools(r1)
+
+    want = [n for c in calls if c[0] == "use_tools"
+            for n in _resolve_tool_names(str(c[1].get("names", "")))]
+    if not want:
+        want = parse_use_request(r1)            # text fallback, no native tools
+    if not want:
+        # A model that skips the toolbox and just emits the call it wants.
+        # Discarding it printed a real write_file call to the user as prose.
+        real = [c for c in calls if c[0] != "use_tools"]
+        if real:
+            _active_tools.update(c[0] for c in real)
+            return r1, real
+        want = names_mentioned(r1)          # format-independent last resort
     if not want:
         return r1, []
     _active_tools.clear()
@@ -908,7 +1071,8 @@ def _turn_reply(messages, model, layers_ref, cfg, store):
     r2 = call_llm(model, messages, gpu_layers=layers_ref,
                   max_tokens=cfg["max_tokens"], num_ctx=cfg["num_ctx"],
                   token_budget=cfg["token_budget"], send_tools=True, store=store)
-    return r2, extract_tools(r2)
+    native2 = last_native_calls()
+    return r2, ([(n, a, i) for i, n, a in native2] or extract_tools(r2))
 
 
 # -----------------------------
@@ -1004,7 +1168,16 @@ def _loads_tolerant(s: str):
         fixed = re.sub(r'\bNone\b', 'null', s)
         fixed = re.sub(r'\bTrue\b', 'true', fixed)
         fixed = re.sub(r'\bFalse\b', 'false', fixed)
-        return json.loads(fixed, strict=False)
+        try:
+            return json.loads(fixed, strict=False)
+        except Exception:
+            # A blob cut off before its closing braces. Measured live: a real
+            # edit_file call arrived exactly one `}` short and was printed to
+            # the user as prose. Close what is open and try once more.
+            deficit = fixed.count("{") - fixed.count("}")
+            if not 0 < deficit <= 3:
+                raise
+            return json.loads(fixed + "}" * deficit, strict=False)
 
 
 def _extract_json_tool_calls(text: str) -> List[Tuple[str, Dict[str, Any]]]:
@@ -1625,6 +1798,34 @@ def _tools_schema() -> List[Dict[str, Any]]:
     return out
 
 
+# The structured tool_calls from the most recent completion, as
+# [(id, name, args_dict), ...]. OpenAI's schema — which Ollama implements —
+# returns tool calls as data with an id that its result must be paired to.
+# The harness used to stringify them and re-parse the string; every text parser
+# below exists because of that, and so did five invented "USE:" dialects, a
+# brace-repair for truncated JSON, and guessed argument names. Text parsing is
+# now the FALLBACK, for models with no native tool support.
+_native: List[List[Tuple[str, str, Dict[str, Any]]]] = [[]]
+
+
+def _native_calls(msg) -> List[Tuple[str, str, Dict[str, Any]]]:
+    """Structured tool calls off a completion, arguments already decoded."""
+    out = []
+    for c in getattr(msg, "tool_calls", None) or []:
+        raw = c.function.arguments
+        try:
+            args = raw if isinstance(raw, dict) else _loads_tolerant(raw)
+        except Exception:
+            continue                      # fall through to the text parser
+        if isinstance(args, dict):
+            out.append((getattr(c, "id", "") or "", c.function.name, args))
+    return out
+
+
+def last_native_calls() -> List[Tuple[str, str, Dict[str, Any]]]:
+    return list(_native[0])
+
+
 def _reply_text(msg) -> str:
     """Normalise a reply into the text form extract_tools understands.
 
@@ -1656,7 +1857,8 @@ def _reply_text(msg) -> str:
 def call_llm(model: str, messages: list, gpu_layers: "Optional[List[Optional[int]]]" = None,
              max_tokens: int = 2000, num_ctx: Optional[int] = None,
              token_budget: int = TOKEN_BUDGET, send_tools: bool = True,
-             store: "Optional[SessionStore]" = None, no_think: bool = False) -> str:
+             store: "Optional[SessionStore]" = None, no_think: bool = False,
+             schema: "Optional[List[Dict[str, Any]]]" = None) -> str:
     budget = token_budget
     trimmed = proactive_trim(messages, budget_tokens=budget, store=store)
     if trimmed:
@@ -1675,7 +1877,7 @@ def call_llm(model: str, messages: list, gpu_layers: "Optional[List[Optional[int
                 options["num_ctx"] = num_ctx
             kw: Dict[str, Any] = {}
             if send_tools:
-                kw["tools"] = _tools_schema()
+                kw["tools"] = _tools_schema() if schema is None else schema
             if no_think:
                 # Ollama honours OpenAI's reasoning_effort; "none" turns off the
                 # hidden thinking pass on reasoning models (qwen3, r1, …) so they
@@ -1695,7 +1897,11 @@ def call_llm(model: str, messages: list, gpu_layers: "Optional[List[Optional[int
                 trimmed = len(messages) - len(working)
                 print(f"\n[Context] Trimmed {trimmed} old message(s) to fit context window.")
                 messages[:] = working
-            return _reply_text(r.choices[0].message)
+            _msg = r.choices[0].message
+            # The standard already returned structure. Keep it, rather than
+            # flattening to text and re-deriving it with regexes.
+            _native[:] = [_native_calls(_msg)]
+            return _reply_text(_msg)
         except BadRequestError as e:
             # Some models reject a tools schema outright. Drop it and retry
             # rather than failing the turn.
@@ -1999,6 +2205,83 @@ def _summarise_result(tool_name: str, result: dict) -> str:
     return json.dumps(result)[:120]
 
 
+_PATH_ALIASES = ("path", "filename", "file", "filepath", "file_path",
+                 "dir_path", "directory", "dirname")
+
+
+def _normalise_args(fn, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Map a near-miss argument name onto the parameter the tool declares.
+
+    read_file takes `filename`, edit_file takes `path`, and they mean the same
+    thing. A model that has just called one carries its argument name to the
+    next and gets file_not_found or missing_required_args — measured live: a
+    read_file(path=…) failed, the model went back for list_files(filename=…)
+    and failed again. Renaming the tools would break the plugin API, so accept
+    either spelling here, once, for every tool.
+    """
+    if not args:
+        return args
+    params = inspect.signature(fn).parameters
+    out = dict(args)
+    for want in params:
+        if want in out or want not in _PATH_ALIASES:
+            continue
+        for alias in _PATH_ALIASES:
+            if alias != want and alias in out and alias not in params:
+                out[want] = out.pop(alias)
+                break
+    return out
+
+
+_READERS = ("read_file", "search_file", "ingest")
+_WRITERS = ("edit_file", "write_file")
+
+
+def _defer_blind_edits(tools: List[Tuple[str, Dict[str, Any]]]):
+    """Hold back an edit of a file this same reply is still reading.
+
+    Measured live: the model emitted read_file(hiMe.py) and edit_file(hiMe.py)
+    in one reply. Both were dispatched, but the edit's old_str was written
+    before the read returned, so it could not have used the contents — it
+    guessed, failed, and the read was wasted. Arguments cannot depend on a
+    result that does not exist yet, so the edit is deferred and the model gets
+    the file first.
+    """
+    read, keep, held = set(), [], []
+    for item in tools:                     # (name, args) or (name, args, call_id)
+        name, args = item[0], item[1]
+        p = args.get("path") or args.get("filename") or args.get("file_path")
+        key = str(resolve_abs_path(p)) if isinstance(p, str) and p else None
+        if name in _WRITERS and key and key in read:
+            held.append(item)
+            continue
+        if name in _READERS and key:
+            read.add(key)
+        keep.append(item)
+    return keep, held
+
+
+def _fill_missing_path(fn, args: Dict[str, Any], turn_paths: List[str]) -> Dict[str, Any]:
+    """Supply the file argument when the turn has been working on exactly one.
+
+    Measured live: the model read hiMe.py, then called
+    edit_file(old_str=…, new_str=…) with no path at all, and the harness
+    answered missing_required_args for the only file in play — information it
+    already had, since it had just read that file at the model's request.
+
+    Strictly one file: with none or several in play this changes nothing and the
+    error stands, so the harness never picks a target on the model's behalf.
+    """
+    params = inspect.signature(fn).parameters
+    want = next((p for p in params
+                 if p in _PATH_ALIASES and params[p].default is inspect.Parameter.empty),
+                None)
+    if not want or want in args:
+        return args
+    seen = list(dict.fromkeys(turn_paths))
+    return {**args, want: seen[0]} if len(seen) == 1 else args
+
+
 # -----------------------------
 # Main loop
 # -----------------------------
@@ -2041,7 +2324,8 @@ def run(model: str, gpu_layers: Optional[int] = None,
               f"/recall <topic> to pull, or I'll check when unsure.")
 
     def remember(role: str, content: str, summary: str = "",
-                 pinned: bool = False, no_index: bool = False) -> dict:
+                 pinned: bool = False, no_index: bool = False,
+                 extra: Optional[Dict[str, Any]] = None) -> dict:
         """Add a message to the window and to disk in one step.
 
         Every message goes to SQLite before it can be folded out of the window,
@@ -2054,8 +2338,13 @@ def run(model: str, gpu_layers: Optional[int] = None,
             m["summary"] = summary
         if pinned:
             m["pinned"] = True
+        if extra:
+            m.update(extra)
         messages.append(m)
-        store.add(seq[0], role, content, summary, no_index=no_index)
+        # Disk keeps a plain role: "tool" is a wire detail, not a new kind of
+        # history, and the store's schema should not learn about it.
+        store.add(seq[0], "user" if role == "tool" else role,
+                  content, summary, no_index=no_index)
         return m
 
     def goal_is_set() -> bool:
@@ -2498,27 +2787,21 @@ def run(model: str, gpu_layers: Optional[int] = None,
         consecutive_errors = 0
         tool_calls_this_turn = 0
         MAX_TOOL_CALLS = 4
-        # Pull, not push: the turn's first model call advertises NO schema and a
+        turn_paths: List[str] = []   # files this turn has actually touched
+        # Pull, not push, on EVERY step: each model call advertises NO schema and a
         # names-only prompt (build_prompt(pull=True)). The model answers directly,
         # or asks for tools with a `USE:` line — then the harness advertises exactly
         # those and re-runs with the schema. Chat turns never see a schema, so weak
-        # models stop tool-hunting on them. Multi-step chaining after the first call
-        # stays plain push below. _active_tools is restored after the turn so /tools
+        # models stop tool-hunting on them; a step never carries more than the tools
+        # that step asked for. _active_tools is restored after the turn so /tools
         # session config survives; unadvertised tools stay callable regardless.
         _advertised_before = set(_active_tools)
-        first = True
         while True:
             print("\nThinking...")
 
             try:
-                if first:
-                    reply, tools = _turn_reply(messages, model, layers_ref, cfg, store)
-                    first = False
-                else:
-                    reply = call_llm(model, messages, gpu_layers=layers_ref,
-                                     max_tokens=cfg["max_tokens"], num_ctx=cfg["num_ctx"],
-                                     token_budget=cfg["token_budget"], store=store)
-                    tools = extract_tools(reply)
+                reply, tools = _turn_reply(messages, model, layers_ref, cfg, store,
+                                           _advertised_before)
             except KeyboardInterrupt:
                 print("\n[Cancelled]")
                 messages.pop()
@@ -2557,17 +2840,29 @@ def run(model: str, gpu_layers: Optional[int] = None,
                     remember("assistant", final)
                 break
 
-            # Record assistant's tool-call turn before injecting results
-            remember("assistant", reply, summary="tool call")
+            tools, _held = _defer_blind_edits(tools)
+
+            # Record assistant's tool-call turn before injecting results. When
+            # the calls came back with ids, echo them in the shape the spec
+            # expects, so each role="tool" result below has a call to pair to.
+            _echo = [{"id": c[2], "type": "function",
+                      "function": {"name": c[0], "arguments": json.dumps(c[1])}}
+                     for c in [*tools, *_held] if len(c) > 2 and c[2]]
+            remember("assistant", reply, summary="tool call",
+                     extra={"tool_calls": _echo} if _echo else None)
 
             turn_had_error = False
-            for name, args in tools:
+            for _item in tools:
+                name, args = _item[0], _item[1]
+                call_id = _item[2] if len(_item) > 2 else ""
                 fn = TOOL_REGISTRY.get(name)
                 if not fn:
                     result = {"error": "unknown_tool", "name": name,
                               "hint": f"Available tools: {list(TOOL_REGISTRY.keys())}"}
                     turn_had_error = True
                 else:
+                    args = _normalise_args(fn, args)
+                    args = _fill_missing_path(fn, args, turn_paths)
                     missing = [
                         p for p, param in inspect.signature(fn).parameters.items()
                         if param.default is inspect.Parameter.empty and p not in args
@@ -2593,15 +2888,37 @@ def run(model: str, gpu_layers: Optional[int] = None,
                             result = {"error": str(e)}
                             turn_had_error = True
 
+                # Remember the file this turn is working on, so a later call
+                # that omits it is answered rather than refused.
+                if isinstance(result, dict) and "error" not in result:
+                    for _k in ("path", "file_path"):
+                        if isinstance(result.get(_k), str):
+                            turn_paths.append(result[_k])
+                            break
+
                 print(f"[result] {_summarise_result(name, result)}")
                 # The one-line summary already printed to the console is what
                 # replaces this in the window once it is folded. Computing it
                 # here costs nothing extra and means folding needs no model.
-                remember("user",
+                # Pair the result to its call the way the spec says, when the
+                # model gave us an id. Models render role="tool" as the
+                # <tool_response> block they were trained on; as role="user"
+                # they saw the string "tool_result(...)" in a user turn instead.
+                remember("tool" if call_id else "user",
                          _cap_tool_result(f"tool_result({json.dumps(result)})",
                                           cfg["token_budget"]),
                          summary=f"{name}: {_summarise_result(name, result)}",
-                         no_index=(name == "read_file"))
+                         no_index=(name == "read_file"),
+                         extra={"tool_call_id": call_id} if call_id else None)
+
+            for _h in _held:
+                _name = _h[0]
+                _hid = _h[2] if len(_h) > 2 else ""
+                print(f"[deferred] {_name} — waiting for the file it reads in the same reply")
+                remember("tool" if _hid else "user",
+                         f"tool_result({json.dumps({'deferred': _name, 'hint': 'Not run: its arguments were written before read_file returned. The file contents are above — re-issue it now using the exact text from them.'})})",
+                         summary=f"{_name}: deferred until the file was read",
+                         extra={"tool_call_id": _hid} if _hid else None)
 
             if turn_had_error:
                 consecutive_errors += 1

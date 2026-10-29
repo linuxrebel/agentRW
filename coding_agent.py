@@ -2686,10 +2686,38 @@ def _flags_to_str(flags: dict) -> str:
     return " ".join(parts)
 
 
+def _saved_default(saved) -> Optional[dict]:
+    """The saved default as {"model": ..., <flags>}, or None.
+
+    The agent writes a dict, but a hand-edited config can hold the command-line
+    form instead: "default": "dolphin3:latest --low-vram". That used to crash
+    startup with AttributeError. Read it the way the command line is read, so
+    its flags are kept; anything unreadable counts as no default.
+    """
+    if isinstance(saved, dict):
+        return saved or None
+    if not isinstance(saved, str) or not saved.strip():
+        return None
+    import argparse
+    import shlex
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("model")
+    p.add_argument("--gpu-layers", type=int, default=None)
+    p.add_argument("--num-ctx", type=int, default=None)
+    p.add_argument("--max-tokens", type=int, default=2000)
+    p.add_argument("--low-vram", action="store_true")
+    try:
+        a, _unknown = p.parse_known_args(shlex.split(saved))
+    except (SystemExit, ValueError):     # argparse exits on a bad value
+        return None
+    return {"model": a.model, "low_vram": a.low_vram, "gpu_layers": a.gpu_layers,
+            "num_ctx": a.num_ctx, "max_tokens": a.max_tokens}
+
+
 def _resolve_model(passed: Optional[str], cli_flags: dict) -> tuple:
     """Returns (model, effective_flags_dict)."""
     cfg = _load_config()
-    saved = cfg.get("default")  # {"model": "...", "low_vram": ..., ...}
+    saved = _saved_default(cfg.get("default"))  # {"model": "...", "low_vram": ..., ...}
 
     if passed is None:
         if saved and "model" in saved:

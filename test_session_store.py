@@ -623,7 +623,21 @@ def test_smalltalk_retired():
     print("  smalltalk guard retired under pull               ok")
 
 
+def test_saved_default_accepts_string_form():
+    # A hand-edited config held "default": "dolphin3:latest --low-vram" and
+    # startup died with AttributeError: 'str' object has no attribute 'items'.
+    d = ca._saved_default("dolphin3:latest --low-vram")
+    assert d["model"] == "dolphin3:latest" and d["low_vram"] is True, d
+    d = ca._saved_default("qwen2.5-coder:7b --gpu-layers 20 --num-ctx 4096")
+    assert (d["gpu_layers"], d["num_ctx"], d["max_tokens"]) == (20, 4096, 2000), d
+    assert ca._saved_default({"model": "m"}) == {"model": "m"}      # normal form
+    for unusable in (None, "", "   ", "m --gpu-layers notanint", 42, {}):
+        assert ca._saved_default(unusable) is None, unusable
+    print("  saved default accepts the string form          ok")
+
+
 if __name__ == "__main__":
+    test_saved_default_accepts_string_form()
     test_ctx_has_ask_and_api_2()
     test_ctx_ask_calls_call_llm()
     test_ctx_no_lint_pipeline_names()

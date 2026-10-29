@@ -100,6 +100,7 @@ def win_test_recall_tool_returns_matches_dict():
 
 # Same order as test_session_store.py's __main__, with the two swaps.
 TESTS = [
+    base.test_saved_default_accepts_string_form,
     base.test_ctx_has_ask_and_api_2,
     base.test_ctx_ask_calls_call_llm,
     base.test_ctx_no_lint_pipeline_names,

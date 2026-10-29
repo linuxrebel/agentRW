@@ -1,0 +1,7 @@
+# cmd.exe needs CRLF: with LF it can misparse parenthesized blocks and labels.
+# Pinned here so install.bat works straight from a checkout, not only from a
+# release build, on every platform and whatever core.autocrlf says.
+*.bat text eol=crlf
+
+# bash needs LF: a CR at the end of a line becomes part of the command.
+*.sh  text eol=lf

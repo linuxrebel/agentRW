@@ -1,5 +1,10 @@
 # /lint — what two full runs turned up
 
+> **Status: historical.** The lint pipeline this describes left the core in
+> e5156e3 and now lives in the [arwLint](https://github.com/linuxrebel/arwLint)
+> plugin. Of §6's fixes, #1 (empty `old_str` replacing the whole file) is fixed
+> in core `edit_file_tool`; #2–#4 belong to arwLint. Kept for the findings.
+
 Written 2026-08-06 against `coding_agent.py` at `3590e60` plus uncommitted
 `/lint` work. Both runs walked all 17 findings in `/home/james/bin/dr-strange.py`
 (35 lines) auto-accepting every proposed fix.

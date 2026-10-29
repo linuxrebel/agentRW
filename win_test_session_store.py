@@ -131,6 +131,7 @@ TESTS = [
     base.test_ingest_tool_is_advertised_and_bridged,
     base.test_ingest_max_chunks_guard_trips_before_model,
     base.test_no_think_sets_reasoning_effort,
+    base.test_bad_request_retry_folds_the_real_window,
     base.test_ingest_guards_empty_digest,
     base.test_parse_use_request,
     base.test_pull_prompt_lists_names_and_use_protocol,

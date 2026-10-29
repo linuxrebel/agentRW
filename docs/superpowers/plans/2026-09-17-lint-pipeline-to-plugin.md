@@ -1,4 +1,5 @@
 # Lint Pipeline → Plugin (ctx.ask) Implementation Plan
+> **Status: implemented** — shipped in dd74a19 (ctx.ask, API 2) and e5156e3 (pipeline moved to arwLint). The unchecked boxes below are the original plan, not open work.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

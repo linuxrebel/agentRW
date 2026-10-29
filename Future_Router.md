@@ -260,6 +260,10 @@ what a thing means and whether it matters.
 
 ## Next concrete step
 
+**Done.** `lint_file` shipped as a tool, and the streaming `/lint` loop this
+document describes now lives in the arwLint plugin (moved out of core in
+e5156e3).
+
 `lint_file` as a tool. `pylint` is already installed, the adapter is ~25 lines, and
 it returns the 135-token summary measured in §1. It is useful standalone and it is
 the first detector the router would consume.

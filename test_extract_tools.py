@@ -207,42 +207,47 @@ def test_ui_arg_mapping():
     assert parse("/search_file a.py needle") == {"filename": "a.py", "text": "needle"}
 
 
-def test_fix_loop_pieces():
-    """/fix must gather every finding in ONE detector run, apply, and defer."""
-    import shutil as _sh
+def test_run_command_reports_timeout():
+    """A command that runs past its timeout must come back as a timeout.
+
+    _run_capped killed it and returned normally, so the model saw
+    returncode 1, empty output and no hint, and had to guess why.
+    """
     import coding_agent as ca
-    if not _sh.which("pylint") or "lint_file" not in ca.TOOL_REGISTRY:
-        return
+    slow = f'"{sys.executable}" -c "import time; time.sleep(10)"'
+    r = ca.run_command_tool(slow, timeout=2)
+    assert r.get("error") == "timeout", r
+    assert r.get("hint"), r
 
-    work = pathlib.Path(tempfile.mkdtemp())
-    ca._agent_cwd[0] = work
-    ca._extra_write_dirs.clear()
-    src = work / "sample.py"
-    src.write_text("import os\nimport sys\nx=1\n")
 
-    calls = []
-    real = ca.TOOL_REGISTRY["lint_file"]
-    ca.TOOL_REGISTRY["lint_file"] = lambda **kw: (calls.append(kw), real(**kw))[1]
+def test_schema_description_is_capped():
+    """The native tool schema is a channel to the model like the prompt, so a
+    plugin docstring gets the same cap and sanitising there too."""
+    import coding_agent as ca
+
+    def long_tool(x: str) -> dict:
+        return {}
+    long_tool.__doc__ = "Do a thing.\x07 " + "word " * 200
+    ca.TOOL_REGISTRY["long_tool"] = long_tool
+    ca._active_tools.add("long_tool")
     try:
-        found = ca._gather_findings(str(src))
+        desc = next(t["function"]["description"] for t in ca._tools_schema()
+                    if t["function"]["name"] == "long_tool")
     finally:
-        ca.TOOL_REGISTRY["lint_file"] = real
+        del ca.TOOL_REGISTRY["long_tool"]
+        ca._active_tools.discard("long_tool")
+    assert desc == ca._safe_doc(long_tool), desc
+    assert len(desc) <= ca.MAX_DOC_CHARS + 1 and "\x07" not in desc, desc
 
-    # The whole point of symbol="*": one run, not one per kind.
-    assert len(calls) == 1, calls
-    assert len(found) >= 3, found
-    assert all({"line", "symbol", "message"} <= set(f) for f in found), found
-    # Descending: an edit shifts every line below it, so working bottom-up keeps
-    # unvisited line numbers valid. Ascending left 13 of 17 findings stale.
-    assert found == sorted(found, key=lambda f: -f["line"])
 
-    # apply
-    assert ca.edit_file_tool(str(src), "x=1", "x = 1")["action"] == "edited"
-    assert "x = 1" in src.read_text()
-
-    # defer writes a ledger line instead of losing the finding
-    ca._defer("sample.py", found[0])
-    assert (work / ca.DEBT_FILE).read_text().startswith("- [ ] sample.py:")
+def test_path_echo_matches_windows_paths():
+    import coding_agent as ca
+    found = ca._PATH_RE.findall(
+        r"read D:\git\AI\agentRW\README.md and /home/x/y.py, see C:/tmp/a.txt "
+        "and https://github.com/linuxrebel/agentRW")
+    assert r"D:\git\AI\agentRW\README.md" in found, found
+    assert "/home/x/y.py" in found and "C:/tmp/a.txt" in found, found
+    assert not any(p.startswith("s:") for p in found), found   # not https:
 
 
 def test_output_is_capped():
@@ -421,7 +426,9 @@ if __name__ == "__main__":
     test_command_aliases()
     test_json_tool_call_format()
     test_output_is_capped()
-    test_fix_loop_pieces()
+    test_run_command_reports_timeout()
+    test_schema_description_is_capped()
+    test_path_echo_matches_windows_paths()
     test_ui_arg_mapping()
     test_lint_file_summarises()
     test_plugin_loading()

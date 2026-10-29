@@ -1,4 +1,5 @@
 # Cross-Session Recall Implementation Plan
+> **Status: implemented** — shipped in 1e240a9, e5c5a62, b260436. The unchecked boxes below are the original plan, not open work.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

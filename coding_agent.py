@@ -223,11 +223,16 @@ def _fs_error(e: Exception, path: Path, key: str = "file_path") -> Dict[str, Any
     if isinstance(e, FileNotFoundError):
         return {"error": "file_not_found", key: str(path),
                 "hint": "Check the path. Use list_files to see what is there."}
-    if isinstance(e, PermissionError):
-        return {"error": "permission_denied", key: str(path)}
-    if isinstance(e, IsADirectoryError):
+    # Windows raises PermissionError, not IsADirectoryError, when a directory
+    # is opened as a file. Check what the path is before calling it denied.
+    # os.path.isdir, not Path.is_dir: it returns False on any OSError, so a
+    # path we may not even stat (/root/x on Linux) stays permission_denied.
+    if isinstance(e, IsADirectoryError) or (
+            isinstance(e, PermissionError) and os.path.isdir(path)):
         return {"error": "not_a_file", key: str(path),
                 "hint": "This is a directory. Use list_files instead."}
+    if isinstance(e, PermissionError):
+        return {"error": "permission_denied", key: str(path)}
     if isinstance(e, NotADirectoryError):
         return {"error": "not_a_directory", key: str(path),
                 "hint": "This is a file. Use read_file instead."}

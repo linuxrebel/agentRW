@@ -1856,6 +1856,19 @@ def proactive_trim(messages: list, budget_tokens: int = TOKEN_BUDGET,
 # -----------------------------
 # LLM call
 # -----------------------------
+def _slash_word(user: str) -> str:
+    """The command word of a `/...` line, lowercased; "" when there is none.
+
+    A bare "/" crashed the loop: lstrip("/") leaves "", "".split() is [], and
+    [0] raised IndexError. So did "//" and "/ ". Two call sites indexed that
+    split directly, so the guard lives here once.
+    """
+    if not user.startswith("/"):
+        return ""
+    parts = user.lstrip("/").split()
+    return parts[0].lower() if parts else ""
+
+
 def _canonical_command(word: str) -> str:
     """Map a slash command to its real name, tolerating the obvious typos.
 
@@ -2819,7 +2832,7 @@ def run(model: str, gpu_layers: Optional[int] = None,
         # Plugin commands. A plugin that gates itself on a missing tool never
         # registers one, so /lint simply does not exist without pylint — it
         # falls through to the model like any other unknown word.
-        _cw = user.lstrip("/").split()[0].lower() if user.startswith("/") else ""
+        _cw = _slash_word(user)
         if _cw in PLUGIN_COMMANDS:
             _ctx = plugin_context(model, cfg, layers_ref)
             try:
@@ -2832,7 +2845,7 @@ def run(model: str, gpu_layers: Optional[int] = None,
         # into tools/ later. Placed after the builtin slash commands so a tool
         # can never shadow /help. Results print but do not enter the context:
         # running a tool yourself informs you, not the model.
-        if user.startswith("/") and user.lstrip("/").split()[0] in TOOL_REGISTRY:
+        if _slash_word(user) in TOOL_REGISTRY:
             _parts = user.lstrip("/").split()
             _fn = TOOL_REGISTRY[_parts[0]]
             _sig = inspect.signature(_fn)

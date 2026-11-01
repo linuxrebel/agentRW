@@ -866,6 +866,20 @@ def test_useless_use_tools_call_is_answered_not_printed():
     print("  useless use_tools call is answered, not shown   ok")
 
 
+
+def test_a_bare_slash_does_not_crash_the_loop():
+    """Typing "/" alone killed the session: lstrip("/") leaves "", "".split()
+    is [], and [0] raised IndexError. Two call sites indexed that split."""
+    for dead in ("/", "//", "/ ", "/\t"):
+        assert ca._slash_word(dead) == "", dead
+    assert ca._slash_word("/lint") == "lint"
+    assert ca._slash_word("/LINT foo") == "lint"
+    assert ca._slash_word("/read_file x.py") == "read_file"
+    assert ca._slash_word("hi") == ""
+    assert ca._slash_word("") == ""
+    print("  a bare / is a no-op, not a traceback            ok")
+
+
 def test_schema_describes_parameters_not_their_names():
     """JSON Schema's `description` says what a parameter MEANS. It used to
     repeat the parameter's own name for every argument of every tool, so a
@@ -1094,6 +1108,7 @@ if __name__ == "__main__":
     test_write_outside_scope_asks_the_user()
     test_budget_never_exceeds_the_window()
     test_useless_use_tools_call_is_answered_not_printed()
+    test_a_bare_slash_does_not_crash_the_loop()
     test_schema_describes_parameters_not_their_names()
     test_native_tool_calls_are_kept_as_data()
     test_names_mentioned_is_format_independent()

@@ -143,6 +143,63 @@ client = OpenAI(
     api_key="ollama",
 )
 
+OLLAMA_URL = "http://localhost:11434"
+# What Ollama loads a model with when nothing says otherwise.
+DEFAULT_LOADED_CTX = 4096
+
+
+def loaded_context(model: str, num_ctx: Optional[int] = None) -> int:
+    """The context window the model is actually running in, in tokens.
+
+    Asked, not assumed. The harness used to pick max_tokens and token_budget
+    with no idea how big the window was: a bare launch sent max_tokens=2000 and
+    token_budget=8000 into a 4096-token load, so its own trim never fired and
+    Ollama silently dropped the OLDEST messages to fit — the tool results
+    carrying the file the model had just been given. It then re-issued the same
+    failing call, because the evidence had been removed from under it.
+    """
+    if num_ctx:
+        return num_ctx
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/show",
+            data=json.dumps({"model": model}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            info = json.loads(r.read()).get("model_info", {}) or {}
+        declared = next((v for k, v in info.items()
+                         if k.endswith(".context_length") and isinstance(v, int)), 0)
+    except Exception:
+        declared = 0
+    # Ollama loads at its own default unless asked for more, and asking for more
+    # costs VRAM on a small card. Take the smaller: what it will actually load.
+    return min(declared, DEFAULT_LOADED_CTX) if declared else DEFAULT_LOADED_CTX
+
+
+def fit_to_window(cfg: Dict[str, Any], model: str) -> Dict[str, Any]:
+    """Clamp max_tokens and token_budget so the harness trims before Ollama does.
+
+    Reserves a quarter of the window for the reply and leaves the rest for the
+    conversation, minus room for the system prompt and tool schema.
+    """
+    window = loaded_context(model, cfg.get("num_ctx"))
+    out = dict(cfg)
+    out["max_tokens"] = max(256, min(cfg["max_tokens"], window // 4))
+    # At most a third of the window for the system prompt and schema. A tool set
+    # that needs more than that does not fit this model, which is what pulling
+    # tools per step is for — reserving a flat 1400 left a 2048-token window
+    # with nothing at all for the conversation.
+    overhead = min(SYSTEM_OVERHEAD_TOKENS, window // 3)
+    room = window - out["max_tokens"] - overhead
+    out["token_budget"] = max(256, min(cfg["token_budget"], room))
+    return out
+
+
+# The system prompt plus a full tool schema, measured: 576 + 779. Held back so
+# the conversation budget cannot claim space they will take.
+SYSTEM_OVERHEAD_TOKENS = 1400
+
 
 # -----------------------------
 # Path utils
@@ -830,6 +887,41 @@ def ingest_tool(path: str) -> Dict[str, Any]:
 ingest_tool.model_facing = True
 
 
+# What each parameter MEANS, for the schema's `description`. This is the only
+# thing a model with native tool calling reads about an argument; the field used
+# to repeat the parameter's own name, which is why old_str kept arriving empty,
+# guessed, or missing. Keep each one short — it ships with the schema.
+edit_file_tool.param_docs = {
+    "path": "Absolute path of the file to change.",
+    "old_str": "The exact text to replace, copied verbatim from the file — "
+               "read the file first. Whitespace and indentation must match.",
+    "new_str": "The text to put in its place.",
+}
+write_file_tool.param_docs = {
+    "filename": "Absolute path of the file to create or overwrite.",
+    "content": "The complete new contents of the file.",
+}
+read_file_tool.param_docs = {
+    "filename": "Absolute path of the file to read.",
+    "start_line": "First line to return, 1-based.",
+    "max_lines": "How many lines to return.",
+}
+search_file_tool.param_docs = {
+    "filename": "Absolute path of the file to search.",
+    "text": "Substring to look for, case-insensitive.",
+}
+list_files_tool.param_docs = {
+    "path": "Absolute path of the directory to list.",
+    "pattern": "Optional glob, e.g. *.py.",
+}
+run_command_tool.param_docs = {
+    "cmd": "The shell command to run, as you would type it.",
+}
+ingest_tool.param_docs = {
+    "path": "Absolute path of the file to digest.",
+}
+
+
 def use_tools_tool(names: str) -> Dict[str, Any]:
     """Load the tools you need for this step, e.g. names="read_file edit_file"."""
     want = _resolve_tool_names(names)
@@ -1063,6 +1155,15 @@ def _turn_reply(messages, model, layers_ref, cfg, store, baseline):
             for n in _resolve_tool_names(str(c[1].get("names", "")))]
     if not want:
         want = parse_use_request(r1)            # text fallback, no native tools
+    if not want:
+        # A use_tools call naming nothing usable — `use_tools(names="use_tools")`
+        # was observed live. Every branch below declines it and the raw meta-call
+        # was printed to the user as the assistant's answer. Dispatch it instead:
+        # use_tools_tool answers with no_such_tool and the available list, so the
+        # model gets a correction and the turn continues.
+        asked = [c for c in calls if c[0] == "use_tools"]
+        if asked:
+            return r1, asked
     if not want:
         # A model that skips the toolbox and just emits the call it wants.
         # Discarding it printed a real write_file call to the user as prose.
@@ -1793,9 +1894,17 @@ def _tools_schema() -> List[Dict[str, Any]]:
         if name not in _active_tools:
             continue
         props, required = {}, []
+        docs = getattr(fn, "param_docs", {})
         for p, prm in inspect.signature(fn).parameters.items():
-            props[p] = {"type": "integer" if prm.annotation is int else "string",
-                        "description": p}
+            # JSON Schema's `description` is how a tool says what a parameter
+            # MEANS. This filled it with the parameter's own name — "old_str":
+            # description "old_str" — for every parameter of every tool, so a
+            # model reading the schema learned nothing and omitted old_str.
+            # A real description when the tool supplies one, and nothing at all
+            # when it does not: a name echoed back is noise that costs tokens.
+            props[p] = {"type": "integer" if prm.annotation is int else "string"}
+            if docs.get(p):
+                props[p]["description"] = docs[p]
             if prm.default is inspect.Parameter.empty:
                 required.append(p)
         out.append({"type": "function", "function": {
@@ -2057,6 +2166,29 @@ def _confirm_command(cmd: str) -> bool:
     return answer in ("y", "yes")
 
 
+def _confirm_write_dir(target: Path) -> bool:
+    """Ask before writing outside the working directory, and remember the answer.
+
+    The refusal used to be handed to the model with the hint "cd into the target
+    directory, or restart with --allow-write" — neither of which the model can
+    do. It retried the identical call until the error guard fired, twice in two
+    sessions. Whether a directory may be written is the user's decision, so it
+    goes to the user, the same way a shell command does.
+    """
+    d = target.parent
+    print(f"\n{ASSISTANT_COLOR}[Write outside the working directory?]{RESET_COLOR} {target}")
+    try:
+        answer = input(f"  allow writes to {d}?  [y]es / [N]o: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Declined.")
+        return False
+    if answer in ("y", "yes"):
+        _extra_write_dirs.append(d)
+        print(f"  Allowed for this session: {d}")
+        return True
+    return False
+
+
 INGEST_MAP_PROMPT = (
     "You summarize a slice of a source file for a durable index. In 2-3 "
     "sentences, say what this slice defines and does. Name key functions, "
@@ -2293,6 +2425,12 @@ def run(model: str, gpu_layers: Optional[int] = None,
         token_budget: int = TOKEN_BUDGET):
     layers_ref = [gpu_layers]  # mutable so call_llm can update it on OOM
     cfg = {"max_tokens": max_tokens, "num_ctx": num_ctx, "token_budget": token_budget}
+    _asked = dict(cfg)
+    cfg = fit_to_window(cfg, model)
+    if cfg != _asked:
+        print(f"[Context] window {loaded_context(model, num_ctx)} tokens — "
+              f"max_tokens {cfg['max_tokens']}, conversation budget "
+              f"{cfg['token_budget']}.")
     hints = []
     if gpu_layers is not None: hints.append(f"gpu_layers={gpu_layers}")
     if num_ctx is not None:    hints.append(f"num_ctx={num_ctx}")
@@ -2881,6 +3019,18 @@ def run(model: str, gpu_layers: Optional[int] = None,
                     elif name == "run_command" and not _confirm_command(args.get("cmd", "")):
                         result = {"error": "denied_by_user",
                                   "hint": "The user declined this command. Do not retry it."}
+                        turn_had_error = True
+                    elif (name in _WRITERS
+                          and isinstance(args.get("path") or args.get("filename"), str)
+                          and not _writable(
+                              resolve_abs_path(args.get("path") or args.get("filename")))
+                          and not _confirm_write_dir(
+                              resolve_abs_path(args.get("path") or args.get("filename")))):
+                        # The decision is the user's, and they have now made it.
+                        result = {"error": "denied_by_user",
+                                  "hint": "The user declined writes to that directory. "
+                                          "Do not retry it; work inside the working "
+                                          "directory or ask them where to put it."}
                         turn_had_error = True
                     else:
                         print(f"[tool] {name} {args}")

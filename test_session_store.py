@@ -793,6 +793,105 @@ def test_missing_path_filled_only_when_unambiguous():
     print("  missing path filled only when unambiguous        ok")
 
 
+
+
+
+def test_write_outside_scope_asks_the_user():
+    """The refusal used to tell the MODEL to "cd into the target directory, or
+    restart with --allow-write" — neither of which a model can do. It retried
+    the identical call until the error guard fired, in two separate sessions.
+    Whether a directory may be written is the user's call, so it goes to them,
+    the same way a shell command does."""
+    import builtins
+    was_cwd, was_dirs = ca._agent_cwd[0], list(ca._extra_write_dirs)
+    real_input = builtins.input
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            ca._agent_cwd[0] = Path(d)
+            outside = Path(d).parent / "somewhere-else" / "x.py"
+            assert not ca._writable(outside), "precondition: outside the scope"
+            builtins.input = lambda *_: "n"
+            assert ca._confirm_write_dir(outside) is False
+            assert not ca._writable(outside), "a no must not grant access"
+            builtins.input = lambda *_: "y"
+            assert ca._confirm_write_dir(outside) is True
+            assert ca._writable(outside), "a yes grants it for the session"
+    finally:
+        builtins.input = real_input
+        ca._agent_cwd[0] = was_cwd
+        ca._extra_write_dirs[:] = was_dirs
+    print("  write outside scope asks the user              ok")
+
+
+def test_budget_never_exceeds_the_window():
+    """The harness must trim before Ollama does. A bare launch sent
+    max_tokens=2000 and token_budget=8000 into a 4096-token load, so its own
+    trim never fired and Ollama dropped the OLDEST messages — the tool results
+    carrying the file the model had just been handed. It then repeated the same
+    failing call with the evidence gone."""
+    asked = {"max_tokens": 2000, "num_ctx": None, "token_budget": 8000}
+    for window in (2048, 4096, 8192, 32768):
+        fit = ca.fit_to_window({**asked, "num_ctx": window}, "any-model")
+        room = window - fit["max_tokens"]
+        assert fit["max_tokens"] <= window // 4, (window, fit)
+        overhead = min(ca.SYSTEM_OVERHEAD_TOKENS, window // 3)
+        assert fit["token_budget"] + overhead <= room, (window, fit)
+        assert fit["token_budget"] >= 256 and fit["max_tokens"] >= 256
+    # a budget that already fits is left alone
+    small = ca.fit_to_window({"max_tokens": 256, "num_ctx": 32768,
+                              "token_budget": 1000}, "any-model")
+    assert small["max_tokens"] == 256 and small["token_budget"] == 1000
+    print("  budget always fits inside the real window       ok")
+
+
+def test_useless_use_tools_call_is_answered_not_printed():
+    """Live: `use_tools(names="use_tools")`. Every branch declined it and the
+    raw meta-call was printed to the user as the assistant's reply. It must be
+    dispatched so the model gets no_such_tool and the available list back."""
+    orig, active = ca.call_llm, set(ca._active_tools)
+    ca.call_llm = lambda model, messages, **kw: 'use_tools({"names":"[\\"use_tools\\"]"})'
+    try:
+        _reply, tools = ca._turn_reply(
+            [{"role": "system", "content": "s"}, {"role": "user", "content": "edit x"}],
+            "m", [None],
+            {"num_ctx": None, "token_budget": ca.TOKEN_BUDGET, "max_tokens": 200},
+            None, {"read_file", "edit_file", "write_file"})
+    finally:
+        ca.call_llm = orig
+        ca._active_tools.clear()
+        ca._active_tools.update(active)
+    assert tools and tools[0][0] == "use_tools", "must dispatch, not print at the user"
+    answer = ca.TOOL_REGISTRY["use_tools"](names='["use_tools"]')
+    assert answer["error"] == "no_such_tool" and "read_file" in answer["hint"]
+    print("  useless use_tools call is answered, not shown   ok")
+
+
+def test_schema_describes_parameters_not_their_names():
+    """JSON Schema's `description` says what a parameter MEANS. It used to
+    repeat the parameter's own name for every argument of every tool, so a
+    model reading the schema learned nothing — old_str kept arriving missing
+    or guessed."""
+    was = set(ca._active_tools)
+    try:
+        ca._active_tools.clear()
+        ca._active_tools.update(n for n in ca.TOOL_REGISTRY if n != "use_tools")
+        for spec in ca._tools_schema():
+            fn_name = spec["function"]["name"]
+            for pname, prop in spec["function"]["parameters"]["properties"].items():
+                desc = prop.get("description")
+                assert desc != pname, f"{fn_name}.{pname} describes itself"
+                if desc is not None:
+                    assert len(desc) > len(pname), f"{fn_name}.{pname}: {desc!r}"
+        edit = next(x for x in ca._tools_schema()
+                    if x["function"]["name"] == "edit_file")
+        old = edit["function"]["parameters"]["properties"]["old_str"]["description"]
+        assert "verbatim" in old and "read the file" in old, old
+    finally:
+        ca._active_tools.clear()
+        ca._active_tools.update(was)
+    print("  schema describes parameters, not their names     ok")
+
+
 def test_native_tool_calls_are_kept_as_data():
     """The spec returns tool calls as structure with an id. Flattening them to
     `name({...})` and re-parsing the string is what every text parser below —
@@ -992,6 +1091,10 @@ if __name__ == "__main__":
     test_backup_is_never_a_write_target()
     test_truncated_tool_call_is_closed_and_parsed()
     test_missing_path_filled_only_when_unambiguous()
+    test_write_outside_scope_asks_the_user()
+    test_budget_never_exceeds_the_window()
+    test_useless_use_tools_call_is_answered_not_printed()
+    test_schema_describes_parameters_not_their_names()
     test_native_tool_calls_are_kept_as_data()
     test_names_mentioned_is_format_independent()
     test_toolbox_is_offered_as_a_tool()

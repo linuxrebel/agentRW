@@ -2450,6 +2450,7 @@ def run(model: str, gpu_layers: Optional[int] = None,
     if max_tokens != 2000:     hints.append(f"max_tokens={max_tokens}")
     hint_str = ("  [" + ", ".join(hints) + "]") if hints else ""
     print(f"Using model: {model}{hint_str}{_INPUT_HINT}")
+    print("Type /help for the list of commands.")
 
     messages = [
         {"role": "system", "content": build_prompt()}

@@ -1,4 +1,5 @@
 # Pull-not-Push Tools Implementation Plan
+> **Status: implemented** — shipped in 06d3732, b3f86d8. The unchecked boxes below are the original plan, not open work.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

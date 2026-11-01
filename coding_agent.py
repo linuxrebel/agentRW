@@ -261,11 +261,16 @@ def _fs_error(e: Exception, path: Path, key: str = "file_path") -> Dict[str, Any
     if isinstance(e, FileNotFoundError):
         return {"error": "file_not_found", key: str(path),
                 "hint": "Check the path. Use list_files to see what is there."}
-    if isinstance(e, PermissionError):
-        return {"error": "permission_denied", key: str(path)}
-    if isinstance(e, IsADirectoryError):
+    # Windows raises PermissionError, not IsADirectoryError, when a directory
+    # is opened as a file. Check what the path is before calling it denied.
+    # os.path.isdir, not Path.is_dir: it returns False on any OSError, so a
+    # path we may not even stat (/root/x on Linux) stays permission_denied.
+    if isinstance(e, IsADirectoryError) or (
+            isinstance(e, PermissionError) and os.path.isdir(path)):
         return {"error": "not_a_file", key: str(path),
                 "hint": "This is a directory. Use list_files instead."}
+    if isinstance(e, PermissionError):
+        return {"error": "permission_denied", key: str(path)}
     if isinstance(e, NotADirectoryError):
         return {"error": "not_a_directory", key: str(path),
                 "hint": "This is a file. Use read_file instead."}
@@ -285,9 +290,7 @@ def read_file_tool(
     try:
         with open(path, "r", encoding="utf-8") as f:
             lines = f.readlines()
-    except OSError as e:
-        return _fs_error(e, path)
-    except UnicodeDecodeError as e:
+    except (OSError, UnicodeDecodeError) as e:
         return _fs_error(e, path)
 
     total = len(lines)
@@ -507,13 +510,21 @@ def _run_capped(cmd: str, timeout: int, cwd: Optional[str] = None,
                threading.Thread(target=drain, args=(proc.stderr, "err"), daemon=True)]
     for t in threads:
         t.start()
+    timed_out = False
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
+        timed_out = True
         proc.kill()
         proc.wait()
     for t in threads:
         t.join(timeout=5)
+    if timed_out:
+        # Raised after the kill and drain, carrying what was captured. Returning
+        # normally made a timeout look like an ordinary failure (returncode 1,
+        # no hint), so the caller never learned the command ran out of time.
+        raise subprocess.TimeoutExpired(cmd, timeout, output="".join(chunks["out"]),
+                                        stderr="".join(chunks["err"]))
     return ("".join(chunks["out"]), "".join(chunks["err"]),
             proc.returncode if proc.returncode is not None else -1,
             hit_cap.is_set())
@@ -565,9 +576,7 @@ def search_file_tool(filename: str, text: str) -> Dict[str, Any]:
             for i, line in enumerate(f, start=1):
                 if needle in line.lower():
                     matches.append({"line": i, "content": line.rstrip()})
-    except OSError as e:
-        return _fs_error(e, p)
-    except UnicodeDecodeError as e:
+    except (OSError, UnicodeDecodeError) as e:
         return _fs_error(e, p)
 
     # matches[:100] used to be returned with no indication that anything was
@@ -789,7 +798,6 @@ def load_plugins(d: Path) -> Dict[str, Any]:
         for pkg in sorted(p for p in owner.iterdir() if p.is_dir()):
             if (pkg / "install.md").is_file():
                 _load_one(pkg, found)
-    return found
     return found
 
 
@@ -1792,7 +1800,9 @@ def _tools_schema() -> List[Dict[str, Any]]:
                 required.append(p)
         out.append({"type": "function", "function": {
             "name": name,
-            "description": (fn.__doc__ or "").strip().split("\n")[0],
+            # _safe_doc, as in the prompt: this is the same plugin-text channel
+            # to the model, so it gets the same cap and sanitising.
+            "description": _safe_doc(fn),
             "parameters": {"type": "object", "properties": props,
                            "required": required}}})
     return out
@@ -1867,7 +1877,6 @@ def call_llm(model: str, messages: list, gpu_layers: "Optional[List[Optional[int
 
     layers = gpu_layers[0] if gpu_layers else None
 
-    working = list(messages)
     while True:
         try:
             options: Dict[str, Any] = {}
@@ -1888,15 +1897,11 @@ def call_llm(model: str, messages: list, gpu_layers: "Optional[List[Optional[int
                 kw["reasoning_effort"] = "none"
             r = client.chat.completions.create(
                 model=model,
-                messages=working,
+                messages=messages,
                 max_tokens=max_tokens,
                 extra_body={"options": options} if options else None,
                 **kw,
             )
-            if len(working) < len(messages):
-                trimmed = len(messages) - len(working)
-                print(f"\n[Context] Trimmed {trimmed} old message(s) to fit context window.")
-                messages[:] = working
             _msg = r.choices[0].message
             # The standard already returned structure. Keep it, rather than
             # flattening to text and re-deriving it with regexes.
@@ -1909,14 +1914,14 @@ def call_llm(model: str, messages: list, gpu_layers: "Optional[List[Optional[int
                 print(f"\n[Tools] {model} rejected the tool schema — retrying without.")
                 send_tools = False
                 continue
-            if "exceed_context_size" in str(e) or getattr(e, "status_code", None) == 400:
-                # Halve the budget and reuse the one trimmer until it can't cut more.
-                budget = max(budget // 2, 200)
-                if not proactive_trim(working, budget_tokens=budget, store=store):
-                    print(f"\n{ASSISTANT_COLOR}[Error]{RESET_COLOR} Context full and nothing left to trim.")
-                    return ""
-            else:
-                print(f"\n{ASSISTANT_COLOR}[Error]{RESET_COLOR} Bad request: {e}")
+            # Every BadRequestError is a 400, so there is no way to tell context
+            # overflow from any other bad request here. Treat it as overflow:
+            # halve the budget and fold in the real window, until nothing is
+            # left to fold, then report the server's own error text.
+            budget = max(budget // 2, 200)
+            if not proactive_trim(messages, budget_tokens=budget, store=store):
+                print(f"\n{ASSISTANT_COLOR}[Error]{RESET_COLOR} Bad request, and nothing "
+                      f"left to trim: {_api_error_text(e)}")
                 return ""
         except APIConnectionError:
             print(
@@ -2085,9 +2090,7 @@ def ingest_file(path: str, model: str, store, layers_ref: list, cfg: dict,
     try:
         with open(abspath, "r", encoding="utf-8") as fh:
             lines = fh.readlines()
-    except OSError as e:
-        return _fs_error(e, abspath)
-    except UnicodeDecodeError as e:
+    except (OSError, UnicodeDecodeError) as e:
         return _fs_error(e, abspath)
 
     key = str(abspath)
@@ -2191,12 +2194,6 @@ def _summarise_result(tool_name: str, result: dict) -> str:
         return f"{result.get('action', 'done')} → {result.get('path', '?')}"
     if tool_name == "search_file":
         return f"{len(result.get('matches', []))} matches in {result.get('file_path', '?')}"
-    if tool_name == "lint_file":
-        if "symbol" in result:
-            return f"{result['count']}x {result['symbol']} in {result.get('file','?')}"
-        n = result.get("total", "?")
-        return (f"score {result.get('score','?')}/10, {n} messages"
-                f"  [{result.get('file','?')}]")
     if tool_name == "run_command":
         rc = result.get("returncode", "?")
         out = (result.get("stdout") or "").strip()
@@ -2280,6 +2277,12 @@ def _fill_missing_path(fn, args: Dict[str, Any], turn_paths: List[str]) -> Dict[
         return args
     seen = list(dict.fromkeys(turn_paths))
     return {**args, want: seen[0]} if len(seen) == 1 else args
+
+
+# Paths in the user's message, echoed back in a [PATHS] block. Unix and ~
+# paths, plus Windows drive paths (D:\x\y or D:/x/y), which the Unix-only
+# pattern never matched.
+_PATH_RE = re.compile(r'(?:~|/[\w.~-]+)(?:/[\w.~-]+)+|\b[A-Za-z]:(?:[\\/][\w.~-]+)+')
 
 
 # -----------------------------
@@ -2743,6 +2746,10 @@ def run(model: str, gpu_layers: Optional[int] = None,
                     print(f"\n[output capped at {MAX_CAPTURE_BYTES:,} bytes — command killed]")
                 elif _rc != 0:
                     print(f"[exit {_rc}]")
+            except subprocess.TimeoutExpired as _te:
+                print(_te.output or "", end="")
+                print(_te.stderr or "", end="")
+                print(f"\n[timed out after {_te.timeout}s — command killed]")
             except KeyboardInterrupt:
                 print()
             continue
@@ -2762,7 +2769,7 @@ def run(model: str, gpu_layers: Optional[int] = None,
         # not in the user's words.
 
         # If message mentions a file/directory path, echo it back so model can't misread it
-        detected = [p.rstrip('.,;:!?)>') for p in re.findall(r'(?:~|/[\w.~-]+)(?:/[\w.~-]+)+', user)]
+        detected = [p.rstrip('.,;:!?)>') for p in _PATH_RE.findall(user)]
         if detected:
             path_block = "\n".join(f"  {p}" for p in detected)
             injected = (
@@ -2998,10 +3005,38 @@ def _flags_to_str(flags: dict) -> str:
     return " ".join(parts)
 
 
+def _saved_default(saved) -> Optional[dict]:
+    """The saved default as {"model": ..., <flags>}, or None.
+
+    The agent writes a dict, but a hand-edited config can hold the command-line
+    form instead: "default": "dolphin3:latest --low-vram". That used to crash
+    startup with AttributeError. Read it the way the command line is read, so
+    its flags are kept; anything unreadable counts as no default.
+    """
+    if isinstance(saved, dict):
+        return saved or None
+    if not isinstance(saved, str) or not saved.strip():
+        return None
+    import argparse
+    import shlex
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("model")
+    p.add_argument("--gpu-layers", type=int, default=None)
+    p.add_argument("--num-ctx", type=int, default=None)
+    p.add_argument("--max-tokens", type=int, default=2000)
+    p.add_argument("--low-vram", action="store_true")
+    try:
+        a, _unknown = p.parse_known_args(shlex.split(saved))
+    except (SystemExit, ValueError):     # argparse exits on a bad value
+        return None
+    return {"model": a.model, "low_vram": a.low_vram, "gpu_layers": a.gpu_layers,
+            "num_ctx": a.num_ctx, "max_tokens": a.max_tokens}
+
+
 def _resolve_model(passed: Optional[str], cli_flags: dict) -> tuple:
     """Returns (model, effective_flags_dict)."""
     cfg = _load_config()
-    saved = cfg.get("default")  # {"model": "...", "low_vram": ..., ...}
+    saved = _saved_default(cfg.get("default"))  # {"model": "...", "low_vram": ..., ...}
 
     if passed is None:
         if saved and "model" in saved:

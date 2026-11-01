@@ -182,7 +182,7 @@ renames and restructures its internals freely; `ctx` is the contract that does
 not move. Check `ctx.api` if you care.
 
 ```
-ctx.api             int, currently 1. Bumped on a breaking change.
+ctx.api             int, currently 2. Bumped on a breaking change.
 
 session
 ctx.model           model name in use
@@ -191,19 +191,15 @@ ctx.layers          mutable GPU-layer ref for call_llm
 ctx.cwd             the agent's working directory
 ctx.tools           the tool registry, e.g. ctx.tools["lint_file"](filename=…)
 
+model
+ctx.ask(messages, max_tokens=300, send_tools=False, no_think=False) -> str
+                    one model call with the harness's trimming and error
+                    handling, on the session's model. No prompt of its own.
+
 paths and writing
 ctx.resolve_path(s) -> Path, honouring the agent's `cd`
 ctx.writable(path)  -> bool, is this inside the allowed write scope
 ctx.write_denied(p) -> the standard refusal dict
-
-findings pipeline
-ctx.gather_findings(target, only="")     flatten a detector's output
-ctx.propose_fix(model, cfg, layers, lines, finding)
-                                          computed when determined, else asks
-ctx.apply_fix(path, lines, finding, new) replace / insert / write, checked
-ctx.finish_run(path, snapshot) -> bool   revert the run if it broke the file
-ctx.defer(target, finding)               append to DEBT.md
-ctx.debt_file                            the ledger's filename
 
 output
 ctx.summarise(tool_name, result)         one-line console echo

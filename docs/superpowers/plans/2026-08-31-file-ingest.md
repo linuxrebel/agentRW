@@ -1,4 +1,5 @@
 # File Ingest Implementation Plan
+> **Status: implemented** — shipped in a5660fa, b3de0b5, 95382a2. The unchecked boxes below are the original plan, not open work.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

@@ -493,6 +493,32 @@ def test_no_think_sets_reasoning_effort():
     print("  no_think passes reasoning_effort=none           ok")
 
 
+def test_bad_request_retry_folds_the_real_window():
+    # call_llm used to fold a private copy on a 400 retry: the DB marked those
+    # messages folded while the caller's window kept them in full.
+    import types
+    calls = {"n": 0}
+    def fake_create(**kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            err = ca.BadRequestError.__new__(ca.BadRequestError)
+            Exception.__init__(err, "context length exceeded")
+            raise err
+        msg = types.SimpleNamespace(tool_calls=None, content="ok", reasoning=None)
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
+    messages = [{"role": "system", "content": "s"}] + [
+        {"role": "user", "content": "x" * 3000, "seq": i} for i in range(1, 10)]
+    orig = ca.client.chat.completions.create
+    ca.client.chat.completions.create = fake_create
+    try:
+        out = ca.call_llm("m", messages, send_tools=False, token_budget=8000)
+    finally:
+        ca.client.chat.completions.create = orig
+    assert out == "ok" and calls["n"] == 2, (out, calls)
+    assert any(m.get("folded") for m in messages), "retry fold must reach the caller's window"
+    print("  400 retry folds the caller's window           ok")
+
+
 def test_reply_text_falls_back_to_reasoning():
     import types
     # content empty (reasoning model hit the length limit before answering)
@@ -909,7 +935,21 @@ def test_smalltalk_retired():
     print("  smalltalk guard retired under pull               ok")
 
 
+def test_saved_default_accepts_string_form():
+    # A hand-edited config held "default": "dolphin3:latest --low-vram" and
+    # startup died with AttributeError: 'str' object has no attribute 'items'.
+    d = ca._saved_default("dolphin3:latest --low-vram")
+    assert d["model"] == "dolphin3:latest" and d["low_vram"] is True, d
+    d = ca._saved_default("qwen2.5-coder:7b --gpu-layers 20 --num-ctx 4096")
+    assert (d["gpu_layers"], d["num_ctx"], d["max_tokens"]) == (20, 4096, 2000), d
+    assert ca._saved_default({"model": "m"}) == {"model": "m"}      # normal form
+    for unusable in (None, "", "   ", "m --gpu-layers notanint", 42, {}):
+        assert ca._saved_default(unusable) is None, unusable
+    print("  saved default accepts the string form          ok")
+
+
 if __name__ == "__main__":
+    test_saved_default_accepts_string_form()
     test_ctx_has_ask_and_api_2()
     test_ctx_ask_calls_call_llm()
     test_ctx_no_lint_pipeline_names()
@@ -940,6 +980,7 @@ if __name__ == "__main__":
     test_ingest_tool_is_advertised_and_bridged()
     test_ingest_max_chunks_guard_trips_before_model()
     test_no_think_sets_reasoning_effort()
+    test_bad_request_retry_folds_the_real_window()
     test_ingest_guards_empty_digest()
     test_parse_use_request()
     test_pull_prompt_lists_names_and_use_protocol()

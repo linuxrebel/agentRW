@@ -52,7 +52,11 @@ the file you would look at. Add one if it chafes.
 
 ## ctx.ask, and namespacing the findings helpers
 
-**Blocking for any non-lint plugin.**
+**Done** in dd74a19 and e5156e3: `ctx.ask` added, `PLUGIN_API` bumped to 2, and
+the findings helpers removed from `ctx` entirely rather than namespaced — they
+moved into arwLint. Kept below as the reasoning.
+
+~~**Blocking for any non-lint plugin.**~~
 
 `ctx` has no way to call a model. The only route is `ctx.propose_fix`, which is
 hard-shaped to "rewrite ONE line for this finding" with `FIX_PROMPT` baked in.
